@@ -39,6 +39,7 @@ class CommandTests(unittest.TestCase):
     def test_opencode_implementation_is_explicitly_automatic(self):
         with mock.patch.object(bridge, "agent_binary", return_value="/bin/opencode"):
             command = bridge.cli_command("opencode", "implement task", "implement")
+        self.assertIn("--standalone", command)
         self.assertIn("--auto", command)
         self.assertEqual(command[-2:], ["--", "implement task"])
 
@@ -140,15 +141,77 @@ class UsageTests(unittest.TestCase):
                 detail = bridge.usage_report({"task_id": "task-demo"})
                 recent = bridge.usage_report({"limit": 5})
             self.assertIn("2 calls", detail)
-            self.assertIn("150 input", detail)
-            self.assertIn("30 output", detail)
-            self.assertIn("60 cached input", detail)
-            self.assertIn("60 total (reported in 1/2 calls)", detail)
+            self.assertIn("codex / gpt-6-luna: 1 calls, 1 with usage reported", detail)
+            self.assertIn("input 100 (1/1)", detail)
+            self.assertIn("claude / sonnet: 1 calls, 1 with usage reported", detail)
+            self.assertIn("total 60 (1/1)", detail)
+            self.assertNotIn("150", detail)
+            self.assertIn("each provider reports them", detail)
+            self.assertNotIn("subset", detail)
             self.assertIn("task-demo", recent)
+            self.assertIn("  - codex / gpt-6-luna", recent)
             with sqlite3.connect(path) as database:
                 columns = {row[1] for row in database.execute("PRAGMA table_info(agent_calls)")}
             self.assertNotIn("prompt", columns)
             self.assertNotIn("response", columns)
+
+
+class UsageGroupingTests(unittest.TestCase):
+    def store(self, path, task_id, agent, model, usage):
+        with mock.patch.object(bridge, "USAGE_DB", path):
+            bridge.store_usage(task_id, agent, model, "implement", 0, False, 1.0, usage)
+
+    def test_mixed_agents_are_never_summed_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "usage.sqlite3")
+            self.store(path, "task-mix", "codex", "gpt-a", {"input_tokens": 100, "cached_input_tokens": 80})
+            self.store(path, "task-mix", "claude", "sonnet", {"input_tokens": 50, "cache_write_tokens": 7})
+            with mock.patch.object(bridge, "USAGE_DB", path):
+                detail = bridge.usage_report({"task_id": "task-mix"})
+                recent = bridge.usage_report({"limit": 5})
+        for text in (detail, recent):
+            self.assertIn("codex / gpt-a: 1 calls, 1 with usage reported | input 100 (1/1), output unavailable (0/1), cached input 80 (1/1)", text)
+            self.assertIn("claude / sonnet: 1 calls, 1 with usage reported | input 50 (1/1), output unavailable (0/1), cached input unavailable (0/1), cache write 7 (1/1)", text)
+            self.assertNotIn("150", text)
+
+    def test_same_agent_with_different_models_is_split(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "usage.sqlite3")
+            self.store(path, "task-models", "codex", "gpt-research", {"input_tokens": 10})
+            self.store(path, "task-models", "codex", "gpt-implement", {"input_tokens": 20})
+            with mock.patch.object(bridge, "USAGE_DB", path):
+                detail = bridge.usage_report({"task_id": "task-models"})
+        self.assertIn("codex / gpt-research: 1 calls, 1 with usage reported | input 10 (1/1)", detail)
+        self.assertIn("codex / gpt-implement: 1 calls, 1 with usage reported | input 20 (1/1)", detail)
+        self.assertNotIn("input 30", detail)
+
+    def test_missing_fields_stay_unavailable_while_zero_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "usage.sqlite3")
+            self.store(path, "task-zero", "agy", "model-x", {"input_tokens": 0, "output_tokens": 5})
+            self.store(path, "task-zero", "agy", "model-x", {"output_tokens": 3})
+            with mock.patch.object(bridge, "USAGE_DB", path):
+                detail = bridge.usage_report({"task_id": "task-zero"})
+                recent = bridge.usage_report({"limit": 5})
+        line = "agy / model-x: 2 calls, 2 with usage reported | input 0 (1/2), output 8 (2/2), cached input unavailable (0/2)"
+        self.assertIn(line, detail)
+        self.assertIn("  - " + line, recent)
+        self.assertIn("reasoning unavailable (0/2)", detail)
+
+    def test_recent_summary_lists_each_task_and_respects_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "usage.sqlite3")
+            self.store(path, "task-old", "codex", "gpt-a", {"input_tokens": 1})
+            self.store(path, "task-new", "codex", "gpt-a", {"input_tokens": 2})
+            self.store(path, "task-new", "claude", "sonnet", {"input_tokens": 3})
+            with mock.patch.object(bridge, "USAGE_DB", path):
+                recent = bridge.usage_report({"limit": 5})
+                latest_only = bridge.usage_report({"limit": 1})
+        self.assertLess(recent.index("task_id=task-new"), recent.index("task_id=task-old"))
+        self.assertIn("  - codex / gpt-a: 1 calls, 1 with usage reported | input 2 (1/1)", recent)
+        self.assertIn("  - claude / sonnet: 1 calls, 1 with usage reported | input 3 (1/1)", recent)
+        self.assertIn("task_id=task-new", latest_only)
+        self.assertNotIn("task-old", latest_only)
 
 
 class ProtocolTests(unittest.TestCase):

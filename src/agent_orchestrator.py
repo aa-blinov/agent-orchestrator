@@ -53,8 +53,11 @@ DEFAULT_AGENTS = {
         "env": "OPENCODE_BIN", "command": "opencode", "label": "OpenCode",
         "model_args": ["--model", "{model}"],
         "args": {
-            "research": ["run", "--format", "json", "--agent", "plan"],
-            "implement": ["run", "--format", "json", "--agent", "build", "--auto"],
+            # The shared OpenCode server can keep the project root from the
+            # lead session and ignore subprocess cwd. A private server makes
+            # each delegated call honor its isolated worktree.
+            "research": ["run", "--standalone", "--format", "json", "--agent", "plan"],
+            "implement": ["run", "--standalone", "--format", "json", "--agent", "build", "--auto"],
         },
         "task_args": {"research": ["--", "{task}"], "implement": ["--", "{task}"]},
     },
@@ -395,39 +398,52 @@ def extract_usage(agent, output):
         output = "\n".join(text.strip() for text in texts if text.strip())
     return output, usage
 
+USAGE_FIELDS = ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens")
+USAGE_LABELS = {"input_tokens": "input", "output_tokens": "output", "cached_input_tokens": "cached input",
+                "cache_write_tokens": "cache write", "reasoning_tokens": "reasoning", "total_tokens": "total"}
+
 def usage_summary(usage):
     if not usage:
         return "Token usage: not reported by CLI."
-    labels = (("input_tokens", "input"), ("output_tokens", "output"),
-              ("cached_input_tokens", "cached input"), ("cache_write_tokens", "cache write"),
-              ("reasoning_tokens", "reasoning"), ("total_tokens", "total"))
-    fields = ["{} {}".format(usage[key], label) for key, label in labels if key in usage]
+    fields = ["{} {}".format(usage[key], USAGE_LABELS[key]) for key in USAGE_FIELDS if key in usage]
     return "Token usage: {} (reported by CLI).".format(", ".join(fields))
 
-def aggregate_usage_summary(rows, fields):
-    labels = {"input_tokens": "input", "output_tokens": "output", "cached_input_tokens": "cached input",
-              "cache_write_tokens": "cache write", "reasoning_tokens": "reasoning", "total_tokens": "total"}
-    summaries = []
-    count = len(rows)
-    for field in fields:
-        values = [row[field] for row in rows if row[field] is not None]
-        if not values:
-            continue
-        suffix = "" if len(values) == count else " (reported in {}/{} calls)".format(len(values), count)
-        summaries.append("{} {}{}".format(sum(values), labels[field], suffix))
-    return ", ".join(summaries) if summaries else "no token counts reported"
+def counter_groups(rows):
+    """Суммирует счётчики только внутри одной пары агент/запрошенная модель.
 
-def grouped_usage_summary(row, count, fields):
-    labels = {"input_tokens": "input", "output_tokens": "output", "cached_input_tokens": "cached input",
-              "cache_write_tokens": "cache write", "reasoning_tokens": "reasoning", "total_tokens": "total"}
-    summaries = []
-    for field in fields:
-        reported = row[field + "_reported"]
-        if not reported:
-            continue
-        suffix = "" if reported == count else " (reported in {}/{} calls)".format(reported, count)
-        summaries.append("{} {}{}".format(row[field], labels[field], suffix))
-    return ", ".join(summaries) if summaries else "no token counts reported"
+    Разные провайдеры считают кэш и рассуждения по-разному, поэтому сложение между
+    группами дало бы число без смысла. NULL означает «не сообщено» и в сумму не входит,
+    а ноль — сообщённое значение, поэтому покрытие считается отдельно от суммы.
+    """
+    groups = {}
+    for row in rows:
+        key = (row["agent"], row["model"])
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {"agent": row["agent"], "model": row["model"], "calls": 0, "reported": 0,
+                                   "present": dict.fromkeys(USAGE_FIELDS, 0), "sums": dict.fromkeys(USAGE_FIELDS, 0)}
+        group["calls"] += 1
+        group["reported"] += 1 if row["usage_reported"] else 0
+        for field in USAGE_FIELDS:
+            if row[field] is not None:
+                group["present"][field] += 1
+                group["sums"][field] += row[field]
+    return list(groups.values())
+
+def counter_text(group):
+    """Выводит сумму и покрытие (сообщивших вызовов / всех вызовов) для каждого счётчика."""
+    parts = []
+    for field in USAGE_FIELDS:
+        present = group["present"][field]
+        if present:
+            parts.append("{} {} ({}/{})".format(USAGE_LABELS[field], group["sums"][field], present, group["calls"]))
+        else:
+            parts.append("{} unavailable (0/{})".format(USAGE_LABELS[field], group["calls"]))
+    return ", ".join(parts)
+
+def group_line(group):
+    return "{} / {}: {} calls, {} with usage reported | {}".format(
+        group["agent"], group["model"], group["calls"], group["reported"], counter_text(group))
 
 def usage_report(args):
     if not isinstance(args, dict):
@@ -438,40 +454,39 @@ def usage_report(args):
         raise ValueError("limit must be an integer from 1 to 100")
     if not os.path.isfile(USAGE_DB):
         return "No usage records yet. Records are stored locally at {}.".format(USAGE_DB)
-    fields = ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens")
     with sqlite3.connect(USAGE_DB, timeout=10) as database:
         database.row_factory = sqlite3.Row
         if task_id:
             rows = database.execute("SELECT * FROM agent_calls WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
             if not rows:
                 return "No usage records found for task_id {}.".format(task_id)
-            report = ["Usage for task_id {} ({} calls; cache reads are shown separately from input):".format(task_id, len(rows))]
+            report = ["Usage for task_id {} ({} calls).".format(task_id, len(rows))]
             for row in rows:
-                usage = {key: row[key] for key in fields if row[key] is not None}
+                usage = {key: row[key] for key in USAGE_FIELDS if row[key] is not None}
                 report.append("- {} | {} | {} / {} | exit {}{} | {:.1f}s | {}".format(
                     row["created_at"], row["agent"], row["mode"], row["model"], row["exit_code"],
                     " / timed out" if row["timed_out"] else "", row["duration_seconds"],
                     usage_summary(usage) if row["usage_reported"] else "Token usage: not reported by CLI."))
-            report.append("Combined reported counters ({} of {} calls): {}".format(
-                sum(row["usage_reported"] for row in rows), len(rows), aggregate_usage_summary(rows, fields)))
-            report.append("Cached input is a subset reported separately; do not add it again to input tokens.")
+            report.append("Counters by agent and model. Sums include only calls from that agent and model; (present/calls) is how many of those calls reported the counter. Groups are not combined.")
+            report.extend("- " + group_line(group) for group in counter_groups(rows))
+            report.append("Cache counters are shown as each provider reports them; do not infer a shared relationship between cache and input fields.")
             return "\n".join(report)
-        rows = database.execute("""SELECT task_id, MIN(created_at) AS first_seen, COUNT(*) AS calls,
-            SUM(usage_reported) AS reported_calls,
-            SUM(input_tokens) AS input_tokens, COUNT(input_tokens) AS input_tokens_reported,
-            SUM(output_tokens) AS output_tokens, COUNT(output_tokens) AS output_tokens_reported,
-            SUM(cached_input_tokens) AS cached_input_tokens, COUNT(cached_input_tokens) AS cached_input_tokens_reported,
-            SUM(cache_write_tokens) AS cache_write_tokens, COUNT(cache_write_tokens) AS cache_write_tokens_reported,
-            SUM(reasoning_tokens) AS reasoning_tokens, COUNT(reasoning_tokens) AS reasoning_tokens_reported,
-            SUM(total_tokens) AS total_tokens, COUNT(total_tokens) AS total_tokens_reported,
-            MAX(id) AS last_id FROM agent_calls GROUP BY task_id ORDER BY last_id DESC LIMIT ?""", (limit,)).fetchall()
-    if not rows:
-        return "No usage records yet."
-    report = ["Recent task usage (cache reads are shown separately from input):"]
-    for row in rows:
-        report.append("- {} | task_id={} | {} calls, {} reported | {}".format(
-            row["first_seen"], row["task_id"], row["calls"], row["reported_calls"],
-            grouped_usage_summary(row, row["calls"], fields) if row["reported_calls"] else "Token usage: not reported by CLI."))
+        tasks = database.execute("""SELECT task_id, MIN(created_at) AS first_seen, COUNT(*) AS calls, MAX(id) AS last_id
+            FROM agent_calls GROUP BY task_id ORDER BY last_id DESC LIMIT ?""", (limit,)).fetchall()
+        if not tasks:
+            return "No usage records yet."
+        task_ids = [task["task_id"] for task in tasks]
+        call_rows = database.execute("SELECT * FROM agent_calls WHERE task_id IN ({}) ORDER BY id".format(
+            ",".join("?" * len(task_ids))), task_ids).fetchall()
+    calls_by_task = {}
+    for row in call_rows:
+        calls_by_task.setdefault(row["task_id"], []).append(row)
+    report = ["Recent task usage. Counters are summed per agent and model only; (present/calls) is how many of those calls reported the counter."]
+    for task in tasks:
+        rows = calls_by_task.get(task["task_id"], [])
+        report.append("- {} | task_id={} | {} calls, {} with usage reported".format(
+            task["first_seen"], task["task_id"], len(rows), sum(row["usage_reported"] for row in rows)))
+        report.extend("  - " + group_line(group) for group in counter_groups(rows))
     report.append("Pass a task_id to inspect its individual calls. Records are stored locally at {}.".format(USAGE_DB))
     return "\n".join(report)
 

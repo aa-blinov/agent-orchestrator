@@ -23,7 +23,7 @@ Selected host CLI
 
 Consultation starts up to three planning calls in a thread pool, each as a separate process group. Implementation records the source repository's `HEAD`, creates a unique branch and worktree under `~/.agent-orchestrator/worktrees/`, then runs one agent in that worktree. New files are included by `git add -N` before the bridge collects the diff.
 
-Each CLI runs in its machine-readable output mode where available. The bridge extracts its reported token usage and keeps the final answer separate from the usage ledger. The ledger is a local SQLite database under the user's data directory; it stores task IDs, agent/model/mode, exit status, duration, and counters, but no prompts or responses. Absent usage fields stay unavailable. Provider counters can differ in how they account for cache and reasoning tokens, so totals are informational and are not converted to cost.
+Each CLI runs in its machine-readable output mode where available. The bridge extracts its reported token usage and keeps the final answer separate from the usage ledger. The ledger is a local SQLite database under the user's data directory; it stores task IDs, agent/model/mode, exit status, duration, and counters, but no prompts or responses. Absent usage fields stay unavailable. Provider counters can differ in how they account for cache and reasoning tokens, so reports sum counters only within one agent and requested model, never across agents, and the sums are informational rather than converted to cost.
 
 ## Decisions worth knowing about
 
