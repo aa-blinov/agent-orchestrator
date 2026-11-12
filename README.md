@@ -37,6 +37,8 @@ Restart the CLIs after registering. Whichever one you launch is the lead for tha
 
 The worktree separates normal file edits from the main checkout. It is not an operating-system sandbox: each CLI retains the permissions of the current user. OpenCode's implementation command uses its automatic permission mode. Only delegate work in repositories and with prompts you trust.
 
+For a concrete complex-task example, including an end-to-end DAG and sample MCP calls, see [the Russian workflow guide](docs/example-complex-task.ru.md). It shows how independent read-only analysis, isolated implementation, and review are intended to reduce reliance on one agent's first framing without promising to eliminate model bias.
+
 ## Screenshots
 
 This project is a terminal service with no graphical interface. Its use is shown with the command examples above.
