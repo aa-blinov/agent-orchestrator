@@ -1,9 +1,12 @@
 import contextlib
+import concurrent.futures
 import io
 import json
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -107,6 +110,11 @@ class CommandTests(unittest.TestCase):
 
 
 class UsageTests(unittest.TestCase):
+    def test_structured_cli_failure_overrides_zero_exit(self):
+        self.assertEqual(bridge.agent_exit_status("agy", 0, '{"status":"ERROR","error":"permission denied"}'), 1)
+        self.assertEqual(bridge.agent_exit_status("agy", 0, '{"status":"SUCCESS","response":"ok"}'), 0)
+        self.assertEqual(bridge.agent_exit_status("codex", 0, '{"type":"turn.failed"}'), 1)
+
     def test_codex_json_stream_reports_usage_and_final_answer(self):
         raw = '\n'.join([
             '{"type":"item.completed","item":{"type":"agent_message","text":"READY"}}',
@@ -280,7 +288,7 @@ class ProtocolTests(unittest.TestCase):
     def test_initialize_advertises_server(self):
         response = self.call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})[0]
         self.assertEqual(response["result"]["serverInfo"]["name"], "agent-orchestrator")
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.2")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.3")
         self.assertIn("session_id", response["result"]["instructions"])
 
     def test_invalid_tool_name_returns_json_rpc_error(self):
@@ -290,6 +298,39 @@ class ProtocolTests(unittest.TestCase):
     def test_notification_has_no_response(self):
         response = self.call({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.assertEqual(response, [])
+
+    def test_tool_validation_error_uses_mcp_error_result(self):
+        args = {"task": "", "cwd": os.getcwd(), "agent": "agy", "mode": "research",
+                "task_id": "task-error", "session_id": "chat-error"}
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.object(bridge, "available_agents", return_value={"agy": {}}):
+            bridge.handle({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                           "params": {"name": "delegate_agent", "arguments": args}})
+        response = json.loads(output.getvalue())
+        self.assertNotIn("error", response)
+        self.assertTrue(response["result"]["isError"])
+
+    def test_cancel_notification_sets_event_and_suppresses_tool_response(self):
+        started, release = threading.Event(), threading.Event()
+        output = io.StringIO()
+        def slow_call(name, args, request_id=None, cancel_event=None):
+            started.set()
+            release.wait(2)
+            return bridge.text_result("finished")
+        with contextlib.redirect_stdout(output), concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool, \
+                mock.patch.object(bridge, "call_tool", side_effect=slow_call):
+            bridge.handle({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                           "params": {"name": "usage_report", "arguments": {}}}, pool)
+            self.assertTrue(started.wait(1))
+            bridge.handle({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": {"requestId": 11, "reason": "client cancelled"}}, pool)
+            release.set()
+            deadline = time.monotonic() + 1
+            while 11 in bridge.MCP_REQUESTS and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(output.getvalue(), "")
+        self.assertNotIn(11, bridge.MCP_REQUESTS)
+
 
     def test_host_orchestrator_is_excluded_from_tools(self):
         with mock.patch.object(bridge, "ORCHESTRATOR", "claude"):
@@ -319,6 +360,33 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("session_id", tools["consult_agents"]["inputSchema"]["required"])
         self.assertIn("task_id", tools["delegate_agent"]["inputSchema"]["required"])
         self.assertIn("session_id", tools["delegate_agent"]["inputSchema"]["required"])
+
+
+class ProcessCancellationTests(unittest.TestCase):
+    def test_cancellation_stops_local_child_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request_id = "local-cancel-test"
+            cancel_event = threading.Event()
+            result_box = []
+            with bridge.MCP_STATE_LOCK:
+                bridge.MCP_REQUESTS[request_id] = cancel_event
+            command = [os.sys.executable, "-c", "import time; time.sleep(30)"]
+            with mock.patch.object(bridge, "cli_command", return_value=command), \
+                    mock.patch.object(bridge, "USAGE_DB", os.path.join(directory, "usage.sqlite3")):
+                worker = threading.Thread(target=lambda: result_box.append(
+                    bridge.execute("agy", "sleep", "research", directory, 10, "native",
+                                   "task-cancel-test", request_id, cancel_event)))
+                worker.start()
+                deadline = time.monotonic() + 2
+                while not bridge.ACTIVE_CHILDREN_BY_REQUEST.get(request_id) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(bridge.ACTIVE_CHILDREN_BY_REQUEST.get(request_id))
+                self.assertTrue(bridge.cancel_request(request_id))
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result_box[0][0], 130)
+            with bridge.MCP_STATE_LOCK:
+                bridge.MCP_REQUESTS.pop(request_id, None)
 
 
 if __name__ == "__main__":

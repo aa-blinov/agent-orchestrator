@@ -10,6 +10,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -22,6 +23,10 @@ MAX_CONSULTANTS = 3
 MAX_SESSION_AGENT_CALLS = 4
 MAX_SESSION_PEERS = 3
 ACTIVE_CHILD_GROUPS = set()
+ACTIVE_CHILDREN_BY_REQUEST = {}
+MCP_REQUESTS = {}
+MCP_STATE_LOCK = threading.RLock()
+MCP_STDOUT_LOCK = threading.Lock()
 
 DEFAULT_AGENTS = {
     "codex": {
@@ -305,8 +310,9 @@ def rpc_error(msg_id, code, message, data=None):
     write_packet({"jsonrpc": "2.0", "id": msg_id, "error": err})
 
 def write_packet(packet):
-    sys.stdout.write(json.dumps(packet, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    with MCP_STDOUT_LOCK:
+        sys.stdout.write(json.dumps(packet, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
 def result(msg_id, value):
     write_packet({"jsonrpc": "2.0", "id": msg_id, "result": value})
@@ -444,6 +450,66 @@ def extract_usage(agent, output):
         output = "\n".join(text.strip() for text in texts if text.strip())
     return output, usage
 
+def agent_exit_status(agent, return_code, output):
+    """Trust structured CLI failure status even when the CLI exits zero."""
+    events = json_events(output)
+    if agent == "agy":
+        for event in reversed(events):
+            if "status" not in event and "error" not in event and "finished_reason" not in event:
+                continue
+            status = event.get("status")
+            error = event.get("error")
+            finished_reason = event.get("finished_reason")
+            if error or (status is not None and status != "SUCCESS") or finished_reason in (
+                    "error", "print_timeout", "interrupted"):
+                return return_code if return_code else 1
+            break
+    if agent == "codex" and any(event.get("type") == "turn.failed" for event in events):
+        return return_code if return_code else 1
+    return return_code
+
+def register_child(request_id, pid):
+    with MCP_STATE_LOCK:
+        ACTIVE_CHILD_GROUPS.add(pid)
+        if request_id is not None:
+            ACTIVE_CHILDREN_BY_REQUEST.setdefault(request_id, set()).add(pid)
+
+def unregister_child(request_id, pid):
+    with MCP_STATE_LOCK:
+        ACTIVE_CHILD_GROUPS.discard(pid)
+        if request_id is not None:
+            children = ACTIVE_CHILDREN_BY_REQUEST.get(request_id)
+            if children:
+                children.discard(pid)
+                if not children:
+                    ACTIVE_CHILDREN_BY_REQUEST.pop(request_id, None)
+
+def signal_child_group(pid, signum):
+    try:
+        os.killpg(pid, signum)
+    except OSError:
+        pass
+
+def escalate_child_group(pid):
+    with MCP_STATE_LOCK:
+        active = pid in ACTIVE_CHILD_GROUPS
+    if active:
+        signal_child_group(pid, signal.SIGKILL)
+
+def cancel_request(request_id):
+    with MCP_STATE_LOCK:
+        cancel_event = MCP_REQUESTS.get(request_id)
+        if cancel_event is None:
+            return False
+        cancel_event.set()
+        pids = list(ACTIVE_CHILDREN_BY_REQUEST.get(request_id, ()))
+    for pid in pids:
+        signal_child_group(pid, signal.SIGTERM)
+        escalation = threading.Timer(5, escalate_child_group, args=(pid,))
+        escalation.daemon = True
+        escalation.start()
+    return True
+
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens")
 USAGE_LABELS = {"input_tokens": "input", "output_tokens": "output", "cached_input_tokens": "cached input",
                 "cache_write_tokens": "cache write", "reasoning_tokens": "reasoning", "total_tokens": "total"}
@@ -558,16 +624,21 @@ def usage_report(args):
     report.append("Pass a task_id to inspect its individual calls. Records are stored locally at {}.".format(USAGE_DB))
     return "\n".join(report)
 
-def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None):
+def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None,
+            request_id=None, cancel_event=None):
     """Запускает группу процессов и не отдаёт дочернему процессу stdin MCP."""
     started = time.monotonic()
     task_id = resolve_task_id(task_id)
+    if cancel_event is not None and cancel_event.is_set():
+        return 130, "Cancelled before agent launch.", False, {}, False
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
     process = subprocess.Popen(cli_command(agent, task, mode, profile), cwd=cwd, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         start_new_session=True)
-    ACTIVE_CHILD_GROUPS.add(process.pid)
+    register_child(request_id, process.pid)
+    if cancel_event is not None and cancel_event.is_set():
+        signal_child_group(process.pid, signal.SIGTERM)
     def finish(code, output, timed_out):
         output, usage = extract_usage(agent, output)
         saved = True
@@ -582,7 +653,11 @@ def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None):
     try:
         raw, _ = process.communicate(timeout=timeout)
         output = raw.decode("utf-8", errors="replace")
-        return finish(process.returncode, output, False)
+        code = agent_exit_status(agent, process.returncode, output)
+        if cancel_event is not None and cancel_event.is_set():
+            code = 130
+            output += "\nAgent call cancelled by the MCP client."
+        return finish(code, output, False)
     except subprocess.TimeoutExpired as exc:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -598,7 +673,7 @@ def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None):
             partial = partial.decode("utf-8", errors="replace")
         return finish(124, partial + "\nTimed out after {} seconds; process group was stopped.".format(timeout), True)
     finally:
-        ACTIVE_CHILD_GROUPS.discard(process.pid)
+        unregister_child(request_id, process.pid)
 
 def git(path, *args):
     proc = subprocess.run(["git", "-C", path] + list(args), stdout=subprocess.PIPE,
@@ -616,7 +691,7 @@ def consultation_command(agent, task, profile=None):
     # Планировщик OpenCode работает для чтения; у Claude и agy есть явные режимы плана.
     return cli_command(agent, task, "research", profile)
 
-def consult(args):
+def consult(args, request_id=None, cancel_event=None):
     task, path = validate_args(args)
     task_id = required_task_id(args)
     session_id = required_session_id(args)
@@ -633,7 +708,8 @@ def consult(args):
     outputs = {}
     statuses = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
-        futures = {pool.submit(execute, a, prompt, "research", path, CONSULT_TIMEOUT, profile, task_id): a for a in agents}
+        futures = {pool.submit(execute, a, prompt, "research", path, CONSULT_TIMEOUT, profile,
+                               task_id, request_id, cancel_event): a for a in agents}
         for future in concurrent.futures.as_completed(futures):
             agent = futures[future]
             try:
@@ -649,9 +725,12 @@ def consult(args):
     failed = all(code != 0 or timed_out for code, timed_out in statuses.values())
     return text_result(report, failed)
 
-def implement(agent, task, path, profile=None, task_id=None, session_id=None):
+def implement(agent, task, path, profile=None, task_id=None, session_id=None,
+              request_id=None, cancel_event=None):
     task_id = resolve_task_id(task_id)
     session_id = resolve_task_id(session_id)
+    if cancel_event is not None and cancel_event.is_set():
+        return "Implementation cancelled before worktree creation.", False
     root = repo_root(path)
     relative_path = os.path.relpath(path, root)
     base = git(root, "rev-parse", "HEAD").strip()
@@ -667,7 +746,9 @@ def implement(agent, task, path, profile=None, task_id=None, session_id=None):
         git(root, "worktree", "add", "-b", branch, worktree, base)
         agent_cwd = worktree if relative_path == "." else os.path.join(worktree, relative_path)
         os.makedirs(agent_cwd, exist_ok=True)
-        code, output, timed_out, usage, saved = execute(agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT, profile, task_id)
+        code, output, timed_out, usage, saved = execute(
+            agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT, profile, task_id,
+            request_id, cancel_event)
         # intent-to-add включает новые файлы в возвращаемый diff.
         git(worktree, "add", "-N", "--", ".")
         status = git(worktree, "status", "--short", "--untracked-files=all").rstrip()
@@ -687,7 +768,7 @@ def implement(agent, task, path, profile=None, task_id=None, session_id=None):
                 "The worktree was preserved for inspection. Error collecting the final report: {}\n"
                 "Agent response:\n{}".format(agent, worktree, branch, base, exc, output if 'output' in locals() else "(agent did not start)"), False)
 
-def call_tool(name, args):
+def call_tool(name, args, request_id=None, cancel_event=None):
     if name == "agent_catalog":
         agent_lines = []
         for key, spec in available_agents().items():
@@ -701,7 +782,7 @@ def call_tool(name, args):
         return usage_report(args)
     task, path = validate_args(args)
     if name == "consult_agents":
-        return consult(args)
+        return consult(args, request_id, cancel_event)
     agent, mode = args.get("agent"), args.get("mode")
     if agent not in available_agents() or mode not in ("research", "implement"):
         raise ValueError("select an agent and mode research or implement")
@@ -711,20 +792,43 @@ def call_tool(name, args):
     if mode == "implement":
         task_id = required_task_id(args)
         session_id = required_session_id(args)
-        report, okay = implement(agent, task, path, profile, task_id, session_id)
+        report, okay = implement(agent, task, path, profile, task_id, session_id,
+                                 request_id, cancel_event)
         return text_result(report, not okay)
     task_id = required_task_id(args)
     session_id = required_session_id(args)
     reserve_agent_calls(session_id, [agent])
-    code, output, timed_out, usage, saved = execute(agent, task, mode, path, CONSULT_TIMEOUT, profile, task_id)
+    code, output, timed_out, usage, saved = execute(
+        agent, task, mode, path, CONSULT_TIMEOUT, profile, task_id, request_id, cancel_event)
     return text_result("Task ID: {} (usage record {})\nAgent: {}\nExit code: {}{}\n{}".format(task_id, "saved" if saved else "not saved", agent, code, " (timed out)" if timed_out else "", output), code != 0 or timed_out)
 
-def handle(request):
+def run_tool_request(msg_id, params, cancel_event):
+    try:
+        value = call_tool(params["name"], params.get("arguments", {}), msg_id, cancel_event)
+        response = value if isinstance(value, dict) else text_result(value)
+    except (ValueError, TypeError) as exc:
+        response = text_result(str(exc), True)
+    except Exception as exc:
+        response = text_result("{}: {}".format(type(exc).__name__, exc), True)
+    with MCP_STATE_LOCK:
+        if not cancel_event.is_set():
+            result(msg_id, response)
+        MCP_REQUESTS.pop(msg_id, None)
+
+def handle(request, executor=None):
     if not isinstance(request, dict):
         rpc_error(None, -32600, "Invalid Request")
         return
     msg_id = request.get("id")
     method = request.get("method")
+    if method == "notifications/cancelled":
+        params = request.get("params", {})
+        request_id = params.get("requestId") if isinstance(params, dict) else None
+        if request_id is not None and not isinstance(request_id, (dict, list, bool)):
+            cancel_request(request_id)
+        return
+    if method and method.startswith("notifications/"):
+        return
     if not isinstance(method, str):
         rpc_error(msg_id, -32600, "method must be a string")
         return
@@ -735,7 +839,7 @@ def handle(request):
         rpc_error(msg_id, -32602, "params must be an object")
     elif method == "initialize":
         result(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-orchestrator", "version": "0.4.2"},
+                        "serverInfo": {"name": "agent-orchestrator", "version": "0.4.3"},
                         "instructions": "Для каждого чата создай один session_id и повторяй его во всех вызовах delegate_agent и consult_agents. Лимит действует на чат: не более четырёх запусков агентов и трёх разных помощников. Обычно достаточно одного исполнителя; ведущий сам проверяет diff и проверки. Подключай других только при конкретном риске или нерешённом вопросе. task_id отдельно группирует вызовы по задаче."})
     elif method == "ping":
         result(msg_id, {})
@@ -746,40 +850,54 @@ def handle(request):
         if not isinstance(name, str) or name not in {t["name"] for t in TOOLS}:
             rpc_error(msg_id, -32602, "Unknown tool: {}".format(name))
             return
-        try:
-            value = call_tool(name, params.get("arguments", {}))
-            result(msg_id, value if isinstance(value, dict) else text_result(value))
-        except ValueError as exc:
-            rpc_error(msg_id, -32602, str(exc))
-        except Exception as exc:
-            result(msg_id, text_result("{}: {}".format(type(exc).__name__, exc), True))
-    elif method and method.startswith("notifications/"):
-        return
+        if msg_id is None or isinstance(msg_id, (dict, list, bool)):
+            rpc_error(msg_id, -32600, "Invalid request id")
+            return
+        with MCP_STATE_LOCK:
+            if msg_id in MCP_REQUESTS:
+                rpc_error(msg_id, -32600, "Request id is already active")
+                return
+            cancel_event = threading.Event()
+            MCP_REQUESTS[msg_id] = cancel_event
+        if executor is None:
+            run_tool_request(msg_id, params, cancel_event)
+        else:
+            executor.submit(run_tool_request, msg_id, params, cancel_event)
     else:
         rpc_error(msg_id, -32601, "Method not found")
 
 def main():
     def stop_children(signum, frame):
-        for pid in list(ACTIVE_CHILD_GROUPS):
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except OSError:
-                pass
+        with MCP_STATE_LOCK:
+            pids = list(ACTIVE_CHILD_GROUPS)
+        for pid in pids:
+            signal_child_group(pid, signal.SIGTERM)
+            escalation = threading.Timer(5, escalate_child_group, args=(pid,))
+            escalation.daemon = True
+            escalation.start()
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, stop_children)
     signal.signal(signal.SIGINT, stop_children)
-    for line in sys.stdin:
-        try:
-            request = json.loads(line)
-        except ValueError as exc:
-            rpc_error(None, -32700, "Parse error", str(exc))
-            continue
-        try:
-            handle(request)
-        except Exception as exc:
-            request_id = request.get("id") if isinstance(request, dict) else None
-            if request_id is not None:
-                result(request_id, text_result("{}: {}".format(type(exc).__name__, exc), True))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+            except ValueError as exc:
+                rpc_error(None, -32700, "Parse error", str(exc))
+                continue
+            try:
+                handle(request, executor)
+            except Exception as exc:
+                request_id = request.get("id") if isinstance(request, dict) else None
+                if request_id is not None:
+                    result(request_id, text_result("{}: {}".format(type(exc).__name__, exc), True))
+        with MCP_STATE_LOCK:
+            pending = list(MCP_REQUESTS.values())
+            pids = list(ACTIVE_CHILD_GROUPS)
+            for event in pending:
+                event.set()
+        for pid in pids:
+            signal_child_group(pid, signal.SIGTERM)
 
 if __name__ == "__main__":
     main()

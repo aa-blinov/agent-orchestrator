@@ -33,9 +33,9 @@ Each CLI runs in its machine-readable output mode where available. The bridge ex
 
 Each agent CLI reads its own login configuration. The bridge only starts the executable and does not read or copy authentication files. An optional model ID can be supplied from the shared model profile; otherwise the CLI's own model choice applies. The cost is that each CLI must already be installed and logged in.
 
-### Use synchronous tools
+### Keep long calls cancellable
 
-The bridge keeps the interaction simple: the selected host waits for a result and receives the diff in the same tool call. Both research and implementation calls can run for up to 7200 seconds, so configure the host MCP timeout to 7200 seconds or more. The cost is that one long-running MCP call blocks the bridge's request loop.
+The selected host waits for a result and receives the diff in the same tool call. The bridge handles requests concurrently, so it can still read MCP cancellation notifications while an agent is running. A cancellation stops the associated child process groups and suppresses the cancelled request's response. Both research and implementation calls can run for up to 7200 seconds, so configure the host MCP timeout to 7200 seconds or more.
 
 ### A worktree is not a sandbox
 

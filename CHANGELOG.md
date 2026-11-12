@@ -4,6 +4,15 @@ All notable changes to Agent Orchestrator. Versions are ordered newest first.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-12
+
+### Fixed
+
+- Detect structured Antigravity and Codex failures even when their CLI exits with status zero.
+- Return tool validation and execution errors using MCP's `isError` result field.
+- Run MCP tool calls concurrently so the server can receive cancellation notifications during long agent calls.
+- Stop cancelled child process groups and suppress responses for cancelled requests.
+
 ## [0.4.2] - 2026-11-12
 
 ### Added

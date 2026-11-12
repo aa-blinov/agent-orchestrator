@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "agent-orchestrator",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Route bounded coding tasks to local coding agents with per-chat call limits and usage reporting.",
   "author": {
     "name": "Alexander Blinov"
