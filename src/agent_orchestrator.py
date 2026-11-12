@@ -404,6 +404,31 @@ def usage_summary(usage):
     fields = ["{} {}".format(usage[key], label) for key, label in labels if key in usage]
     return "Token usage: {} (reported by CLI).".format(", ".join(fields))
 
+def aggregate_usage_summary(rows, fields):
+    labels = {"input_tokens": "input", "output_tokens": "output", "cached_input_tokens": "cached input",
+              "cache_write_tokens": "cache write", "reasoning_tokens": "reasoning", "total_tokens": "total"}
+    summaries = []
+    count = len(rows)
+    for field in fields:
+        values = [row[field] for row in rows if row[field] is not None]
+        if not values:
+            continue
+        suffix = "" if len(values) == count else " (reported in {}/{} calls)".format(len(values), count)
+        summaries.append("{} {}{}".format(sum(values), labels[field], suffix))
+    return ", ".join(summaries) if summaries else "no token counts reported"
+
+def grouped_usage_summary(row, count, fields):
+    labels = {"input_tokens": "input", "output_tokens": "output", "cached_input_tokens": "cached input",
+              "cache_write_tokens": "cache write", "reasoning_tokens": "reasoning", "total_tokens": "total"}
+    summaries = []
+    for field in fields:
+        reported = row[field + "_reported"]
+        if not reported:
+            continue
+        suffix = "" if reported == count else " (reported in {}/{} calls)".format(reported, count)
+        summaries.append("{} {}{}".format(row[field], labels[field], suffix))
+    return ", ".join(summaries) if summaries else "no token counts reported"
+
 def usage_report(args):
     if not isinstance(args, dict):
         raise ValueError("arguments must be an object")
@@ -427,26 +452,26 @@ def usage_report(args):
                     row["created_at"], row["agent"], row["mode"], row["model"], row["exit_code"],
                     " / timed out" if row["timed_out"] else "", row["duration_seconds"],
                     usage_summary(usage) if row["usage_reported"] else "Token usage: not reported by CLI."))
-            totals = {key: sum(row[key] or 0 for row in rows) for key in fields}
-            available = {key: totals[key] for key in fields if any(row[key] is not None for row in rows)}
             report.append("Combined reported counters ({} of {} calls): {}".format(
-                sum(row["usage_reported"] for row in rows), len(rows), usage_summary(available)))
+                sum(row["usage_reported"] for row in rows), len(rows), aggregate_usage_summary(rows, fields)))
             report.append("Cached input is a subset reported separately; do not add it again to input tokens.")
             return "\n".join(report)
         rows = database.execute("""SELECT task_id, MIN(created_at) AS first_seen, COUNT(*) AS calls,
             SUM(usage_reported) AS reported_calls,
-            SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
-            SUM(cached_input_tokens) AS cached_input_tokens, SUM(cache_write_tokens) AS cache_write_tokens,
-            SUM(reasoning_tokens) AS reasoning_tokens, SUM(total_tokens) AS total_tokens,
+            SUM(input_tokens) AS input_tokens, COUNT(input_tokens) AS input_tokens_reported,
+            SUM(output_tokens) AS output_tokens, COUNT(output_tokens) AS output_tokens_reported,
+            SUM(cached_input_tokens) AS cached_input_tokens, COUNT(cached_input_tokens) AS cached_input_tokens_reported,
+            SUM(cache_write_tokens) AS cache_write_tokens, COUNT(cache_write_tokens) AS cache_write_tokens_reported,
+            SUM(reasoning_tokens) AS reasoning_tokens, COUNT(reasoning_tokens) AS reasoning_tokens_reported,
+            SUM(total_tokens) AS total_tokens, COUNT(total_tokens) AS total_tokens_reported,
             MAX(id) AS last_id FROM agent_calls GROUP BY task_id ORDER BY last_id DESC LIMIT ?""", (limit,)).fetchall()
     if not rows:
         return "No usage records yet."
     report = ["Recent task usage (cache reads are shown separately from input):"]
     for row in rows:
-        usage = {key: row[key] for key in fields if row[key] is not None}
         report.append("- {} | task_id={} | {} calls, {} reported | {}".format(
             row["first_seen"], row["task_id"], row["calls"], row["reported_calls"],
-            usage_summary(usage) if usage else "Token usage: not reported by CLI."))
+            grouped_usage_summary(row, row["calls"], fields) if row["reported_calls"] else "Token usage: not reported by CLI."))
     report.append("Pass a task_id to inspect its individual calls. Records are stored locally at {}.".format(USAGE_DB))
     return "\n".join(report)
 

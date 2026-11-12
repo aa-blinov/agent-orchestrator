@@ -136,13 +136,14 @@ class UsageTests(unittest.TestCase):
                 bridge.store_usage("task-demo", "codex", "gpt-6-luna", "implement", 0, False, 2.5,
                                    {"input_tokens": 100, "output_tokens": 20, "cached_input_tokens": 60})
                 bridge.store_usage("task-demo", "claude", "sonnet", "research", 0, False, 1.0,
-                                   {"input_tokens": 50, "output_tokens": 10})
+                                   {"input_tokens": 50, "output_tokens": 10, "total_tokens": 60})
                 detail = bridge.usage_report({"task_id": "task-demo"})
                 recent = bridge.usage_report({"limit": 5})
             self.assertIn("2 calls", detail)
             self.assertIn("150 input", detail)
             self.assertIn("30 output", detail)
             self.assertIn("60 cached input", detail)
+            self.assertIn("60 total (reported in 1/2 calls)", detail)
             self.assertIn("task-demo", recent)
             with sqlite3.connect(path) as database:
                 columns = {row[1] for row in database.execute("PRAGMA table_info(agent_calls)")}
