@@ -214,6 +214,62 @@ class UsageGroupingTests(unittest.TestCase):
         self.assertNotIn("task-old", latest_only)
 
 
+class BudgetTests(unittest.TestCase):
+    def test_budget_counts_parallel_calls_and_rejects_the_fifth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "usage.sqlite3")
+            bridge.reserve_agent_calls("task-budget", ["agy", "claude"], path)
+            bridge.reserve_agent_calls("task-budget", ["opencode"], path)
+            bridge.reserve_agent_calls("task-budget", ["agy"], path)
+            with self.assertRaisesRegex(ValueError, "used 4/4"):
+                bridge.reserve_agent_calls("task-budget", ["claude"], path)
+            with sqlite3.connect(path) as database:
+                row = database.execute("SELECT calls_reserved FROM session_agent_budgets WHERE session_id = ?",
+                                       ("task-budget",)).fetchone()
+        self.assertEqual(row[0], 4)
+
+    def test_budget_limits_distinct_peer_agents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "usage.sqlite3")
+            bridge.reserve_agent_calls("task-peers", ["agy", "claude", "opencode"], path)
+            with self.assertRaisesRegex(ValueError, "limit is 3"):
+                bridge.reserve_agent_calls("task-peers", ["codex"], path)
+
+    def test_session_budget_isolated_from_other_chats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "usage.sqlite3")
+            bridge.reserve_agent_calls("chat-a", ["agy", "claude"], path)
+            bridge.reserve_agent_calls("chat-a", ["opencode"], path)
+            bridge.reserve_agent_calls("chat-a", ["agy"], path)
+            with self.assertRaisesRegex(ValueError, "used 4/4"):
+                bridge.reserve_agent_calls("chat-a", ["claude"], path)
+            bridge.reserve_agent_calls("chat-b", ["agy"], path)
+            self.assertIn("1/4 calls used", bridge.session_budget_line("chat-b", path))
+            self.assertIn("4/4 calls used", bridge.session_budget_line("chat-a", path))
+
+    def test_tool_call_is_rejected_before_fifth_agent_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            usage_path = os.path.join(directory, "usage.sqlite3")
+            args = {"task": "research", "cwd": directory, "agent": "agy", "mode": "research",
+                    "task_id": "task-one", "session_id": "chat-one"}
+            with mock.patch.object(bridge, "HOME", os.path.realpath(directory)), \
+                    mock.patch.object(bridge, "USAGE_DB", usage_path), \
+                    mock.patch.object(bridge, "execute", return_value=(0, "ok", False, {}, True)) as execute:
+                for _ in range(4):
+                    bridge.call_tool("delegate_agent", args)
+                with self.assertRaisesRegex(ValueError, "used 4/4"):
+                    bridge.call_tool("delegate_agent", args)
+        self.assertEqual(execute.call_count, 4)
+
+    def test_agent_calls_require_a_stable_task_id(self):
+        with self.assertRaisesRegex(ValueError, "task_id is required"):
+            bridge.required_task_id({})
+        self.assertEqual(bridge.required_task_id({"task_id": "task-ok"}), "task-ok")
+        with self.assertRaisesRegex(ValueError, "session_id is required"):
+            bridge.required_session_id({})
+        self.assertEqual(bridge.required_session_id({"session_id": "chat-ok"}), "chat-ok")
+
+
 class ProtocolTests(unittest.TestCase):
     def call(self, request):
         output = io.StringIO()
@@ -224,6 +280,8 @@ class ProtocolTests(unittest.TestCase):
     def test_initialize_advertises_server(self):
         response = self.call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})[0]
         self.assertEqual(response["result"]["serverInfo"]["name"], "agent-orchestrator")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.2")
+        self.assertIn("session_id", response["result"]["instructions"])
 
     def test_invalid_tool_name_returns_json_rpc_error(self):
         response = self.call({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": []}})[0]
@@ -251,6 +309,16 @@ class ProtocolTests(unittest.TestCase):
             codex_tools = bridge.tools_for_host()
         delegate = next(item for item in codex_tools if item["name"] == "delegate_agent")
         self.assertNotIn("codex", delegate["inputSchema"]["properties"]["agent"]["enum"])
+
+    def test_agent_tool_descriptions_include_cost_aware_default(self):
+        tools = {item["name"]: item for item in bridge.tools_for_host()}
+        self.assertIn("четыре запуска агента", tools["consult_agents"]["description"])
+        self.assertIn("только если независимые мнения могут изменить", tools["consult_agents"]["description"])
+        self.assertIn("повторяй вызов лишь после сбоя", tools["delegate_agent"]["description"])
+        self.assertIn("task_id", tools["consult_agents"]["inputSchema"]["required"])
+        self.assertIn("session_id", tools["consult_agents"]["inputSchema"]["required"])
+        self.assertIn("task_id", tools["delegate_agent"]["inputSchema"]["required"])
+        self.assertIn("session_id", tools["delegate_agent"]["inputSchema"]["required"])
 
 
 if __name__ == "__main__":

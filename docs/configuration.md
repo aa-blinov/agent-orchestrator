@@ -36,6 +36,21 @@ The bridge requests structured output from each CLI and stores the input, output
 
 The bridge includes a `native` profile when no configuration file exists. If the file exists, its `default_profile` must name one of the configured profiles. An omitted `profile` uses this default.
 
+Each `delegate_agent` and `consult_agents` call requires a `task_id` and a `session_id`. Reuse one `session_id` for every agent call in a chat, including calls for different tasks in that chat; use a new one in a new chat. The bridge atomically allows at most four launched agent calls and three distinct peer agents per `session_id`. A consultation with two agents uses two call slots. The server cannot read a host chat identifier from standard MCP tool arguments, so the orchestrating agent creates the session ID once and carries it forward. `usage_report` accepts `session_id` to inspect the budget. This is a hard limit per supplied identifier; it cannot authenticate that an identifier corresponds to a particular chat.
+
+## MCP call timeout
+
+The maximum runtime for each consultation or implementation agent call is 7200 seconds. Set the host's MCP tool timeout to at least 7200 seconds as well; otherwise the host may stop waiting before the bridge returns. Configure the per-server timeout in each client:
+
+| Client | Configuration |
+| --- | --- |
+| Codex | `~/.codex/config.toml`: `[mcp_servers.local-agents]` → `tool_timeout_sec = 7200` |
+| Antigravity | `~/.gemini/config/mcp_config.json`: `mcpServers.local-agents.timeoutSeconds = 7200` |
+| Claude Code | `~/.claude.json`: `mcpServers.local-agents.timeout = 7200000` (milliseconds) |
+| OpenCode | `~/.config/opencode/opencode.jsonc`: `mcp.servers.local-agents.timeout.execution = 7200000` (milliseconds) |
+
+The Codex plugin's bundled MCP server uses the host's 60-second default. For long calls, keep its skill enabled and use the regular MCP registration with `tool_timeout_sec` above; disable the bundled server to avoid duplicate tools.
+
 ## Add a CLI agent
 
 Add an entry under `agents`. The bridge builds a subprocess argument list directly; it does not run the configured command through a shell.

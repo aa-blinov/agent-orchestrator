@@ -17,11 +17,36 @@ claude mcp add --scope user --env AGENT_ORCHESTRATOR_HOST=claude local-agents --
 opencode mcp add local-agents --global --env AGENT_ORCHESTRATOR_HOST=opencode -- python3 "$PWD/src/agent_orchestrator.py"
 ```
 
-For Codex, timeout and approval settings go in `~/.codex/config.toml` under `[mcp_servers.local-agents]`:
+## Codex plugin
+
+This repository also contains a local Codex plugin package (`plugin.json`, `mcp.json`, and the `agent-orchestration` skill). It bundles the MCP bridge and uses the same local coding CLIs and logins already configured on the computer. Python 3 and the peer CLIs must be installed locally.
+
+From this repository directory, install it through the included personal marketplace:
+
+```bash
+codex plugin marketplace add .
+codex plugin add agent-orchestrator@agent-orchestrator-local
+```
+
+Start a new Codex chat after installation so it loads the plugin's skill. This is a desktop-only local plugin because it starts local programs; public-directory submission for local MCP plugins requires partner approval.
+
+Codex currently uses a 60-second default timeout for plugin MCP tools. For long-running work, keep the plugin enabled for its skill and register the bridge as a regular MCP server with a longer timeout. Disable the plugin's bundled server to avoid duplicate tools. In `~/.codex/config.toml`:
 
 ```toml
-tool_timeout_sec = 1000
+[plugins."agent-orchestrator@agent-orchestrator-local"]
+enabled = true
+
+[plugins."agent-orchestrator@agent-orchestrator-local".mcp_servers.local-agents]
+enabled = false
+
+[mcp_servers.local-agents]
+command = "python3"
+args = ["/absolute/path/to/agent-orchestrator/src/agent_orchestrator.py"]
+tool_timeout_sec = 7200
 default_tools_approval_mode = "prompt"
+
+[mcp_servers.local-agents.env]
+AGENT_ORCHESTRATOR_HOST = "codex"
 ```
 
 Restart the CLIs after registering. Whichever one you launch is the lead for that session. It can delegate bounded work or ask peers for a second opinion. The bridge removes the active lead from its own peer list to prevent recursive calls. For implementation, it creates a new branch and worktree and returns a diff; the lead reviews and integrates it.
@@ -29,7 +54,9 @@ Restart the CLIs after registering. Whichever one you launch is the lead for tha
 ## What it does
 
 - **`agent_catalog`** lists available command-line agents, preferred models, and model profiles.
-- **`consult_agents`** asks two or three different agents for independent opinions at the same time, in their read-only planning modes; optionally select a model profile.
+- **Default routing rule:** one lead and one implementer. The lead reviews the diff and runs checks. Add an independent reviewer only when risk warrants it; ask for research only when an unresolved question could change the plan. Retry only after a failed call or a concrete finding.
+- **Chat limit:** `delegate_agent` and `consult_agents` require the same `session_id` for the whole chat. The bridge allows at most four agent CLI launches and three distinct peer agents in that chat; a parallel consultation consumes one launch per agent. Rejected calls start no agents. Use a separate `task_id` for usage reports. The session ID is supplied by the lead because MCP does not provide a standard chat identifier to local servers.
+- **`consult_agents`** asks two or three different agents for independent read-only opinions in parallel. Use it only when comparing independent views can materially change a high-stakes or uncertain decision; it replaces a single research call.
 - **`delegate_agent`** runs one agent in research mode or implementation mode. Implementation starts from the repository's current `HEAD` in a new Git worktree; optionally select a model profile. OpenCode delegates use a private server so the shared background server cannot redirect work into the lead session's project directory.
 - **Token usage** is recorded locally after each agent call, separately from its response. Use `usage_report` to inspect recent tasks or calls for a `task_id`. Pass the same `task_id` to group several agent calls into one task. Totals are per agent and requested model, never combined across agents. Missing counts are marked as unavailable; prompts are not stored and the bridge does not estimate counts or convert them to money.
 - **Review before integration.** The bridge returns the worktree path, branch, changed files, summary, diff, and the agent's response. It does not merge or push.
@@ -79,7 +106,7 @@ Codex-specific timeout and approval settings go in `~/.codex/config.toml`:
 
 | Setting | Value | What it does |
 | --- | --- | --- |
-| `tool_timeout_sec` | `1000` | Leaves room for the bridge's 900-second implementation limit. |
+| `tool_timeout_sec` | `7200` | Allows up to two hours for one MCP tool call. |
 | `default_tools_approval_mode` | `"prompt"` | Asks before a model invokes a bridge tool. |
 
 The bridge searches `PATH` for configured executables. Override built-in paths with `AGY_BIN`, `CLAUDE_BIN`, or `OPENCODE_BIN`; custom agent `my-agent` can use `AGENT_ORCHESTRATOR_BIN_MY_AGENT`. The variable must point to an installed executable. Authentication remains in each CLI; the bridge passes a model only when one is set in the selected profile or as the agent's preference for that role.
@@ -87,8 +114,8 @@ The bridge searches `PATH` for configured executables. Override built-in paths w
 | Bridge limit | Default | What it limits |
 | --- | --- | --- |
 | Task length | 20,000 characters | A single delegated prompt. |
-| Consultation timeout | 360 seconds | Each read-only agent call. |
-| Implementation timeout | 900 seconds | One implementation call. |
+| Consultation timeout | 7200 seconds | Each read-only agent call. |
+| Implementation timeout | 7200 seconds | One implementation call. |
 | Returned agent output | 18,000 characters | The tail of each CLI response. |
 | Consultation agents | 3 | Maximum parallel opinions. |
 

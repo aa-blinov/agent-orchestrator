@@ -7,7 +7,6 @@ name: release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,13 +16,19 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+
+      - name: Test
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Compile
+        run: python3 -m compileall -q src scripts
 
       - name: Extract the version
         id: version
@@ -33,12 +38,21 @@ jobs:
           echo "Building $VERSION"
 
       - name: Build
-        # Replace with the real build. The rule is that the artefact that
-        # ships is produced by the same command the README documents.
-        run: echo "Replace with the build command for this stack."
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="agent-orchestrator-${VERSION}/" -o "dist/agent-orchestrator-${VERSION}.tar.gz" HEAD
+          awk -v version="$VERSION" '
+            index($0, "## [" version "]") == 1 { in_version=1; next }
+            in_version && /^## / { exit }
+            in_version { print }
+          ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          test -s dist/RELEASE_NOTES.md
 
       - name: Publish
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          generate_release_notes: true
-          body_path: CHANGELOG.md
+          files: dist/agent-orchestrator-${{ steps.version.outputs.version }}.tar.gz
+          body_path: dist/RELEASE_NOTES.md

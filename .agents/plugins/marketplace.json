@@ -1,0 +1,20 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/marketplace.schema.json",
+  "name": "agent-orchestrator-local",
+  "plugins": [
+    {
+      "name": "agent-orchestrator",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "interface": {
+        "displayName": "Agent Orchestrator"
+      }
+    }
+  ]
+}

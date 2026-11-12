@@ -21,6 +21,8 @@ Selected host CLI
   → The selected host reviews and integrates
 ```
 
+The default routing policy is one lead and one implementer. The lead inspects the result and runs relevant checks; for high-risk changes it can ask one other agent for a focused read-only review. For a material unresolved question, it can ask one agent for research. Parallel consultation is reserved for cases where comparing two or three independent opinions could change a high-stakes decision, and replaces a single research call. Retry only after a failed call or a concrete finding. The bridge enforces at most four agent CLI launches and three distinct peer agents per caller-supplied `session_id`, shared by both delegation tools. `task_id` independently groups usage for a task. MCP clients do not give this local stdio server a standard chat ID, so the host creates one `session_id` per chat and reuses it; the limit is hard for that ID, not an authenticated host identity.
+
 Consultation starts up to three planning calls in a thread pool, each as a separate process group. Implementation records the source repository's `HEAD`, creates a unique branch and worktree under `~/.agent-orchestrator/worktrees/`, then runs one agent in that worktree. New files are included by `git add -N` before the bridge collects the diff.
 
 Each CLI runs in its machine-readable output mode where available. The bridge extracts its reported token usage and keeps the final answer separate from the usage ledger. The ledger is a local SQLite database under the user's data directory; it stores task IDs, agent/model/mode, exit status, duration, and counters, but no prompts or responses. Absent usage fields stay unavailable. Provider counters can differ in how they account for cache and reasoning tokens, so reports sum counters only within one agent and requested model, never across agents, and the sums are informational rather than converted to cost.
@@ -33,7 +35,7 @@ Each agent CLI reads its own login configuration. The bridge only starts the exe
 
 ### Use synchronous tools
 
-The bridge keeps the interaction simple: the selected host waits for a result and receives the diff in the same tool call. Configure its MCP timeout above 900 seconds to exceed the implementation limit. The cost is that one long-running MCP call blocks the bridge's request loop.
+The bridge keeps the interaction simple: the selected host waits for a result and receives the diff in the same tool call. Both research and implementation calls can run for up to 7200 seconds, so configure the host MCP timeout to 7200 seconds or more. The cost is that one long-running MCP call blocks the bridge's request loop.
 
 ### A worktree is not a sandbox
 
