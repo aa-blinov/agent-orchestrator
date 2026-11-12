@@ -101,11 +101,16 @@ def load_settings(path=CONFIG_PATH):
                 raise ValueError("agent {!r} needs args and task_args for {} mode".format(name, mode))
         if "preferred_model" in spec and not isinstance(spec["preferred_model"], str):
             raise ValueError("agent {!r} preferred_model must be a string".format(name))
+        preferred_models = spec.get("preferred_models", {})
+        if not isinstance(preferred_models, dict) or set(preferred_models) - {"research", "implement"}:
+            raise ValueError("agent {!r} preferred_models may contain research and implement only".format(name))
+        if any(not isinstance(model, str) for model in preferred_models.values()):
+            raise ValueError("agent {!r} preferred_models must contain strings".format(name))
         if "model_args" in spec and (not isinstance(spec["model_args"], list)
                                      or not all(isinstance(value, str) for value in spec["model_args"])):
             raise ValueError("agent {!r} model_args must be a list of strings".format(name))
-        if spec.get("preferred_model") and not spec.get("model_args"):
-            raise ValueError("agent {!r} needs model_args to use preferred_model".format(name))
+        if (spec.get("preferred_model") or any(preferred_models.values())) and not spec.get("model_args"):
+            raise ValueError("agent {!r} needs model_args to use preferred models".format(name))
         if not isinstance(spec["label"], str):
             raise ValueError("agent {!r} label must be a string".format(name))
         agents[name] = spec
@@ -146,11 +151,13 @@ def agent_binary(agent):
         raise RuntimeError("{} CLI not found; install it or set {}".format(agent, env_name))
     return binary
 
-def agent_model(agent, profile=None):
+def agent_model(agent, profile=None, mode=None):
     profile = profile or DEFAULT_PROFILE
     if profile not in PROFILES:
         raise ValueError("unknown model profile: {}".format(profile))
-    return PROFILES[profile].get("models", {}).get(agent) or AGENTS[agent].get("preferred_model", "")
+    return (PROFILES[profile].get("models", {}).get(agent)
+            or AGENTS[agent].get("preferred_models", {}).get(mode, "")
+            or AGENTS[agent].get("preferred_model", ""))
 
 def profile_schema():
     return {"type": "string", "enum": sorted(PROFILES), "default": DEFAULT_PROFILE,
@@ -219,7 +226,7 @@ def cli_command(agent, task, mode, profile=None):
         raise ValueError("unknown mode: {}".format(mode))
     binary = agent_binary(agent)
     spec = AGENTS[agent]
-    model = agent_model(agent, profile)
+    model = agent_model(agent, profile, mode)
     def expand(parts):
         values = []
         for part in parts:
@@ -344,10 +351,12 @@ def call_tool(name, args):
     if name == "agent_catalog":
         agent_lines = []
         for key, spec in available_agents().items():
-            model = agent_model(key)
-            agent_lines.append("- {}: {} (model: {})".format(key, spec["label"], model or "CLI default"))
+            research_model = agent_model(key, mode="research") or "CLI default"
+            implement_model = agent_model(key, mode="implement") or "CLI default"
+            agent_lines.append("- {}: {}; complex/research: {}; implementation: {}".format(
+                key, spec["label"], research_model, implement_model))
         profile_lines = ["- {}: {}".format(key, value.get("description", "custom model choices")) for key, value in sorted(PROFILES.items())]
-        return "Current orchestrator: {}. Available peer agents:\n{}\n\nModel profiles (default: {}):\n{}\n\nSelect a profile when delegating or consulting. The profile only overrides models explicitly configured for that agent; otherwise its preferred model or CLI default is used. Implementation runs in a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions.".format(ORCHESTRATOR, "\n".join(agent_lines) or "(none)", DEFAULT_PROFILE, "\n".join(profile_lines))
+        return "Current orchestrator: {}. Available peer agents:\n{}\n\nModel profiles (default: {}):\n{}\n\nEach agent can use a separate preferred model for research/complex reasoning and implementation. A selected profile overrides those role preferences; when no model is configured, the CLI's own default is used. Implementation runs in a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions.".format(ORCHESTRATOR, "\n".join(agent_lines) or "(none)", DEFAULT_PROFILE, "\n".join(profile_lines))
     task, path = validate_args(args)
     if name == "consult_agents":
         return consult(args)

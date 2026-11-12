@@ -10,6 +10,7 @@ All notable changes to Agent Orchestrator. Versions are ordered newest first.
 - Excluded the active host from peer tools to prevent recursive delegation.
 - Renamed the project and bridge to host-neutral names.
 - Added a shared JSON configuration for built-in and custom CLIs, preferred models, and per-task model profiles.
+- Added separate preferred models for research and implementation roles.
 
 ## 0.1.0 (2026)
 

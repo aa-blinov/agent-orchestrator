@@ -44,7 +44,7 @@ This project is a terminal service with no graphical interface. Its use is shown
 
 Each CLI stores its own MCP connection. The commands above record an absolute script path and select the active lead with `AGENT_ORCHESTRATOR_HOST`. Agent and model preferences are shared in `~/.config/agent-orchestrator/config.json`; the bridge reads this file when each CLI starts.
 
-Use `preferred_model` for one agent's normal model and named profiles to switch models per task. A missing model keeps the choice configured in that agent's own CLI. For example:
+Give each agent separate `research` (complex analysis and consultation) and `implement` (making changes) models. Named profiles can override them for a particular task. If a model is missing, the CLI uses its own configured default. For example:
 
 ```json
 {
@@ -60,12 +60,17 @@ Use `preferred_model` for one agent's normal model and named profiles to switch 
     }
   },
   "agents": {
-    "claude": {"preferred_model": "sonnet"}
+    "claude": {
+      "preferred_models": {
+        "research": "opus",
+        "implement": "sonnet"
+      }
+    }
   }
 }
 ```
 
-The leading agent can pass `profile: "strong"` to `delegate_agent` or `consult_agents`. To add a CLI, add an entry under `agents` with its executable, label, mode arguments and task arguments; the example in [the configuration guide](docs/configuration.md) shows the complete entry. Commands are passed as argument arrays without a shell. Restart the leading CLI after editing the file.
+The leading agent can pass `profile: "strong"` to `delegate_agent` or `consult_agents`. Consultation and research use the `research` model; implementation uses the `implement` model. To add a CLI, add an entry under `agents` with its executable, label, mode arguments and task arguments; the example in [the configuration guide](docs/configuration.md) shows the complete entry. Commands are passed as argument arrays without a shell. Restart the leading CLI after editing the file.
 
 Codex-specific timeout and approval settings go in `~/.codex/config.toml`:
 
@@ -74,7 +79,7 @@ Codex-specific timeout and approval settings go in `~/.codex/config.toml`:
 | `tool_timeout_sec` | `1000` | Leaves room for the bridge's 900-second implementation limit. |
 | `default_tools_approval_mode` | `"prompt"` | Asks before a model invokes a bridge tool. |
 
-The bridge searches `PATH` for configured executables. Override built-in paths with `AGY_BIN`, `CLAUDE_BIN`, or `OPENCODE_BIN`; custom agent `my-agent` can use `AGENT_ORCHESTRATOR_BIN_MY_AGENT`. The variable must point to an installed executable. Authentication remains in each CLI; the bridge passes a model only when one is set in the selected profile or as the agent's preference.
+The bridge searches `PATH` for configured executables. Override built-in paths with `AGY_BIN`, `CLAUDE_BIN`, or `OPENCODE_BIN`; custom agent `my-agent` can use `AGENT_ORCHESTRATOR_BIN_MY_AGENT`. The variable must point to an installed executable. Authentication remains in each CLI; the bridge passes a model only when one is set in the selected profile or as the agent's preference for that role.
 
 | Bridge limit | Default | What it limits |
 | --- | --- | --- |

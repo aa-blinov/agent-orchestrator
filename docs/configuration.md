@@ -4,7 +4,7 @@ The bridge reads `~/.config/agent-orchestrator/config.json` at startup. Set `XDG
 
 ## Model preferences
 
-Give an agent a normal model with `preferred_model`. Define named profiles for exceptions, then pass the profile name to `delegate_agent` or `consult_agents` when needed:
+Give each agent a separate model for `research` (complex analysis and consultation) and `implement` (making changes). Define named profiles for exceptions, then pass the profile name to `delegate_agent` or `consult_agents` when needed:
 
 ```json
 {
@@ -24,13 +24,13 @@ Give an agent a normal model with `preferred_model`. Define named profiles for e
     }
   },
   "agents": {
-    "claude": {"preferred_model": "sonnet"},
-    "opencode": {"preferred_model": "provider/model-id"}
+    "claude": {"preferred_models": {"research": "opus", "implement": "sonnet"}},
+    "opencode": {"preferred_models": {"research": "provider/strong-model", "implement": "provider/fast-model"}}
   }
 }
 ```
 
-Replace the example identifiers with models available in the corresponding CLI. A model in the selected profile takes precedence over `preferred_model`; if neither is set, the bridge leaves model selection to the CLI. Antigravity and Claude Code accept their own model identifier with `--model`; OpenCode uses its provider-qualified model identifier. See the [Antigravity CLI guide](https://antigravity.google/docs/cli/headless/), [Claude Code CLI reference](https://docs.anthropic.com/en/docs/claude-code/cli-usage), and [OpenCode model guide](https://opencode.ai/docs/models/).
+Replace the example identifiers with models available in the corresponding CLI. A model in the selected profile takes precedence over the role-specific `preferred_models`; the legacy `preferred_model` is a fallback for both roles. If neither is set, the bridge leaves model selection to the CLI. Antigravity and Claude Code accept their own model identifier with `--model`; OpenCode uses its provider-qualified model identifier. See the [Antigravity CLI guide](https://antigravity.google/docs/cli/headless/), [Claude Code CLI reference](https://docs.anthropic.com/en/docs/claude-code/cli-usage), and [OpenCode model guide](https://opencode.ai/docs/models/).
 
 The bridge includes a `native` profile when no configuration file exists. If the file exists, its `default_profile` must name one of the configured profiles. An omitted `profile` uses this default.
 
@@ -45,6 +45,10 @@ Add an entry under `agents`. The bridge builds a subprocess argument list direct
       "command": "my-agent",
       "label": "My coding agent",
       "preferred_model": "model-name",
+      "preferred_models": {
+        "research": "reasoning-model",
+        "implement": "coding-model"
+      },
       "model_args": ["--model", "{model}"],
       "args": {
         "research": ["--plan"],

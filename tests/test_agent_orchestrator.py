@@ -34,15 +34,26 @@ class CommandTests(unittest.TestCase):
 
     def test_profile_model_is_added_to_native_command(self):
         agents = dict(bridge.AGENTS)
-        agents["claude"] = dict(agents["claude"], preferred_model="sonnet")
+        agents["claude"] = dict(agents["claude"], preferred_models={"research": "haiku", "implement": "sonnet"})
         with mock.patch.object(bridge, "AGENTS", agents):
             with mock.patch.object(bridge, "PROFILES", {"native": {"models": {}}, "strong": {"models": {"claude": "opus"}}}):
                 with mock.patch.object(bridge, "agent_binary", return_value="/bin/claude"):
                     command = bridge.cli_command("claude", "review this", "research", "strong")
                     default_command = bridge.cli_command("claude", "review this", "research")
         self.assertIn("opus", command)
-        self.assertNotIn("sonnet", command)
-        self.assertIn("sonnet", default_command)
+        self.assertNotIn("haiku", command)
+        self.assertIn("haiku", default_command)
+
+    def test_agent_can_choose_a_different_model_for_implementation(self):
+        agents = dict(bridge.AGENTS)
+        agents["claude"] = dict(agents["claude"], preferred_models={"research": "opus", "implement": "sonnet"})
+        with mock.patch.object(bridge, "AGENTS", agents):
+            with mock.patch.object(bridge, "PROFILES", {"native": {"models": {}}}):
+                with mock.patch.object(bridge, "agent_binary", return_value="/bin/claude"):
+                    research = bridge.cli_command("claude", "task", "research")
+                    implementation = bridge.cli_command("claude", "task", "implement")
+        self.assertIn("opus", research)
+        self.assertIn("sonnet", implementation)
 
     def test_config_can_register_a_generic_agent(self):
         config = {
@@ -53,7 +64,7 @@ class CommandTests(unittest.TestCase):
                     "command": "my-agent", "label": "My agent",
                     "args": {"research": ["--plan"], "implement": ["--edit"]},
                     "task_args": {"research": ["--prompt", "{task}"], "implement": ["--prompt", "{task}"]},
-                    "model_args": ["--model", "{model}"], "preferred_model": "model-x",
+                    "model_args": ["--model", "{model}"], "preferred_models": {"research": "model-x"},
                 }
             },
         }
@@ -63,7 +74,7 @@ class CommandTests(unittest.TestCase):
                 json.dump(config, output)
             agents, profiles, default = bridge.load_settings(path)
         self.assertEqual(default, "native")
-        self.assertEqual(agents["my-agent"]["preferred_model"], "model-x")
+        self.assertEqual(agents["my-agent"]["preferred_models"]["research"], "model-x")
         self.assertIn("native", profiles)
 
     def test_custom_agent_command_template_uses_separate_arguments(self):
