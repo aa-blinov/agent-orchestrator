@@ -1,6 +1,8 @@
 import contextlib
 import io
 import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -30,6 +32,52 @@ class CommandTests(unittest.TestCase):
             with mock.patch("os.path.isfile", return_value=True):
                 self.assertEqual(bridge.agent_binary("claude"), "/bin/claude")
 
+    def test_profile_model_is_added_to_native_command(self):
+        agents = dict(bridge.AGENTS)
+        agents["claude"] = dict(agents["claude"], preferred_model="sonnet")
+        with mock.patch.object(bridge, "AGENTS", agents):
+            with mock.patch.object(bridge, "PROFILES", {"native": {"models": {}}, "strong": {"models": {"claude": "opus"}}}):
+                with mock.patch.object(bridge, "agent_binary", return_value="/bin/claude"):
+                    command = bridge.cli_command("claude", "review this", "research", "strong")
+                    default_command = bridge.cli_command("claude", "review this", "research")
+        self.assertIn("opus", command)
+        self.assertNotIn("sonnet", command)
+        self.assertIn("sonnet", default_command)
+
+    def test_config_can_register_a_generic_agent(self):
+        config = {
+            "default_profile": "native",
+            "profiles": {"native": {"description": "CLI default", "models": {}}},
+            "agents": {
+                "my-agent": {
+                    "command": "my-agent", "label": "My agent",
+                    "args": {"research": ["--plan"], "implement": ["--edit"]},
+                    "task_args": {"research": ["--prompt", "{task}"], "implement": ["--prompt", "{task}"]},
+                    "model_args": ["--model", "{model}"], "preferred_model": "model-x",
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            with open(path, "w", encoding="utf-8") as output:
+                json.dump(config, output)
+            agents, profiles, default = bridge.load_settings(path)
+        self.assertEqual(default, "native")
+        self.assertEqual(agents["my-agent"]["preferred_model"], "model-x")
+        self.assertIn("native", profiles)
+
+    def test_custom_agent_command_template_uses_separate_arguments(self):
+        spec = {
+            "command": "my-agent", "label": "My agent", "preferred_model": "model-x",
+            "model_args": ["--model", "{model}"],
+            "args": {"research": ["--plan"], "implement": ["--edit"]},
+            "task_args": {"research": ["--prompt", "{task}"], "implement": ["--prompt", "{task}"]},
+        }
+        with mock.patch.dict(bridge.AGENTS, {"my-agent": spec}):
+            with mock.patch.object(bridge, "agent_binary", return_value="/bin/my-agent"):
+                command = bridge.cli_command("my-agent", "task with spaces", "implement")
+        self.assertEqual(command, ["/bin/my-agent", "--edit", "--model", "model-x", "--prompt", "task with spaces"])
+
 
 class ProtocolTests(unittest.TestCase):
     def call(self, request):
@@ -56,6 +104,8 @@ class ProtocolTests(unittest.TestCase):
         delegate = next(item for item in tools if item["name"] == "delegate_agent")
         self.assertNotIn("claude", delegate["inputSchema"]["properties"]["agent"]["enum"])
         self.assertIn("agy", delegate["inputSchema"]["properties"]["agent"]["enum"])
+        self.assertIn("profile", delegate["inputSchema"]["properties"])
+        self.assertIn("native", delegate["inputSchema"]["properties"]["profile"]["enum"])
 
 
 if __name__ == "__main__":

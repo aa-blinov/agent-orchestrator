@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Локальный stdio-мост MCP для контролируемой передачи задач кодовым CLI."""
 import concurrent.futures
+import copy
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -18,11 +20,115 @@ CONSULT_TIMEOUT = 360
 MAX_CONSULTANTS = 3
 ACTIVE_CHILD_GROUPS = set()
 
-AGENTS = {
-    "agy": {"env": "AGY_BIN", "command": "agy", "label": "Antigravity CLI (Google/Gemini account and models)"},
-    "claude": {"env": "CLAUDE_BIN", "command": "claude", "label": "Claude Code (Claude models and coding harness)"},
-    "opencode": {"env": "OPENCODE_BIN", "command": "opencode", "label": "OpenCode (model/provider configured in OpenCode)"},
+DEFAULT_AGENTS = {
+    "agy": {
+        "env": "AGY_BIN", "command": "agy", "label": "Antigravity CLI",
+        "model_args": ["--model", "{model}"],
+        "args": {
+            "research": ["--mode", "plan"],
+            "implement": ["--mode", "accept-edits"],
+        },
+        "task_args": {"research": ["--print={task}"], "implement": ["--print={task}"]},
+    },
+    "claude": {
+        "env": "CLAUDE_BIN", "command": "claude", "label": "Claude Code",
+        "model_args": ["--model", "{model}"],
+        "args": {
+            "research": ["--permission-mode", "plan", "--print"],
+            "implement": ["--permission-mode", "acceptEdits", "--print"],
+        },
+        "task_args": {"research": ["--", "{task}"], "implement": ["--", "{task}"]},
+    },
+    "opencode": {
+        "env": "OPENCODE_BIN", "command": "opencode", "label": "OpenCode",
+        "model_args": ["--model", "{model}"],
+        "args": {
+            "research": ["run", "--format", "default", "--agent", "plan"],
+            "implement": ["run", "--format", "default", "--agent", "build", "--auto"],
+        },
+        "task_args": {"research": ["--", "{task}"], "implement": ["--", "{task}"]},
+    },
 }
+
+CONFIG_ROOT = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+CONFIG_PATH = os.path.join(CONFIG_ROOT, "agent-orchestrator", "config.json")
+
+def load_settings(path=CONFIG_PATH):
+    """Загружает настройки пользователей, не требуя их для штатного запуска."""
+    settings = {"agents": {}, "profiles": {"native": {"description": "Use each CLI's configured default model", "models": {}}}, "default_profile": "native"}
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as source:
+            user_settings = json.load(source)
+        if not isinstance(user_settings, dict):
+            raise ValueError("{} must contain a JSON object".format(path))
+        if not isinstance(user_settings.get("agents", {}), dict):
+            raise ValueError("config 'agents' must be an object")
+        if not isinstance(user_settings.get("profiles", {}), dict):
+            raise ValueError("config 'profiles' must be an object")
+        settings["agents"].update(user_settings.get("agents", {}))
+        settings["profiles"].update(user_settings.get("profiles", {}))
+        settings["default_profile"] = user_settings.get("default_profile", "native")
+
+    agents = copy.deepcopy(DEFAULT_AGENTS)
+    for name, override in settings["agents"].items():
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+            raise ValueError("invalid agent name {!r}; use lowercase letters, numbers, '_' or '-'".format(name))
+        if not isinstance(override, dict):
+            raise ValueError("agent {!r} settings must be an object".format(name))
+        if override.get("enabled", True) is False:
+            agents.pop(name, None)
+            continue
+        spec = copy.deepcopy(agents.get(name, {}))
+        for key, value in override.items():
+            if key == "enabled":
+                continue
+            if key in ("args", "task_args") and isinstance(value, dict):
+                spec.setdefault(key, {}).update(value)
+            else:
+                spec[key] = value
+        for key in ("command", "label", "args", "task_args"):
+            if key not in spec:
+                raise ValueError("agent {!r} needs {!r} in config".format(name, key))
+        if not isinstance(spec["command"], str) or not spec["command"].strip():
+            raise ValueError("agent {!r} command must be a non-empty string".format(name))
+        if "env" in spec and not isinstance(spec["env"], str):
+            raise ValueError("agent {!r} env must be a string".format(name))
+        for mode in ("research", "implement"):
+            if (not isinstance(spec["args"].get(mode), list)
+                    or not all(isinstance(value, str) for value in spec["args"][mode])
+                    or not isinstance(spec["task_args"].get(mode), list)
+                    or not all(isinstance(value, str) for value in spec["task_args"][mode])):
+                raise ValueError("agent {!r} needs args and task_args for {} mode".format(name, mode))
+        if "preferred_model" in spec and not isinstance(spec["preferred_model"], str):
+            raise ValueError("agent {!r} preferred_model must be a string".format(name))
+        if "model_args" in spec and (not isinstance(spec["model_args"], list)
+                                     or not all(isinstance(value, str) for value in spec["model_args"])):
+            raise ValueError("agent {!r} model_args must be a list of strings".format(name))
+        if spec.get("preferred_model") and not spec.get("model_args"):
+            raise ValueError("agent {!r} needs model_args to use preferred_model".format(name))
+        if not isinstance(spec["label"], str):
+            raise ValueError("agent {!r} label must be a string".format(name))
+        agents[name] = spec
+
+    profiles = settings["profiles"]
+    if not profiles or any(not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name) for name in profiles):
+        raise ValueError("profile names must use lowercase letters, numbers, '_' or '-'")
+    for name, profile in profiles.items():
+        if not isinstance(profile, dict) or not isinstance(profile.get("models", {}), dict):
+            raise ValueError("profile {!r} must contain a models object".format(name))
+        unknown = set(profile.get("models", {})) - set(agents)
+        if unknown:
+            raise ValueError("profile {!r} refers to unknown agents: {}".format(name, ", ".join(sorted(unknown))))
+        if any(not isinstance(model, str) for model in profile.get("models", {}).values()):
+            raise ValueError("profile {!r} model names must be strings".format(name))
+        for agent, model in profile.get("models", {}).items():
+            if model and not agents[agent].get("model_args"):
+                raise ValueError("agent {!r} needs model_args to use a profile model".format(agent))
+    if settings["default_profile"] not in profiles:
+        raise ValueError("default_profile must name a profile in config")
+    return agents, profiles, settings["default_profile"]
+
+AGENTS, PROFILES, DEFAULT_PROFILE = load_settings()
 
 # The host that loaded this MCP server is the orchestrator. Excluding it avoids
 # recursive calls while leaving every other installed CLI available.
@@ -34,10 +140,21 @@ def available_agents():
 def agent_binary(agent):
     """Находит CLI по переопределению или в текущем PATH."""
     spec = AGENTS[agent]
-    binary = os.environ.get(spec["env"]) or shutil.which(spec["command"])
+    env_name = spec.get("env", "AGENT_ORCHESTRATOR_BIN_" + agent.upper().replace("-", "_"))
+    binary = os.environ.get(env_name) or (spec["command"] if os.path.isfile(spec["command"]) else shutil.which(spec["command"]))
     if not binary or not os.path.isfile(binary):
-        raise RuntimeError("{} CLI not found; install it or set {}".format(agent, spec["env"]))
+        raise RuntimeError("{} CLI not found; install it or set {}".format(agent, env_name))
     return binary
+
+def agent_model(agent, profile=None):
+    profile = profile or DEFAULT_PROFILE
+    if profile not in PROFILES:
+        raise ValueError("unknown model profile: {}".format(profile))
+    return PROFILES[profile].get("models", {}).get(agent) or AGENTS[agent].get("preferred_model", "")
+
+def profile_schema():
+    return {"type": "string", "enum": sorted(PROFILES), "default": DEFAULT_PROFILE,
+            "description": "Model profile; omitted means {}.".format(DEFAULT_PROFILE)}
 
 def tool(name, description, properties, required):
     return {"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}}
@@ -45,11 +162,21 @@ def tool(name, description, properties, required):
 def tools_for_host():
     agents = available_agents()
     names = list(agents)
-    return [
-    tool("agent_catalog", "Show available coding harnesses and how to choose among them. Does not start an agent.", {}, []),
-    tool("consult_agents", "Ask up to three other agents in parallel for independent read-only opinions. Use for hard tradeoffs, architecture, uncertain root causes, or a second review. The current orchestrator is excluded.", {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}}, ["agents", "task", "cwd"]),
-    tool("delegate_agent", "Hand a bounded task to another installed agent. Research mode is read-only. Implement mode creates a fresh Git worktree/branch and returns status and diff. It never merges or pushes; the current orchestrator reviews and integrates the result.", {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}}, ["agent", "task", "cwd", "mode"]),
-    ]
+    profile = profile_schema()
+    tools = [tool("agent_catalog", "Show available coding agents, preferred models, and model profiles.", {}, [])]
+    if len(names) >= 2:
+        tools.append(tool(
+            "consult_agents",
+            "Ask up to three other agents in parallel for independent read-only opinions. Use for hard tradeoffs, architecture, uncertain root causes, or a second review. The current orchestrator is excluded. Optionally select a model profile.",
+            {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}, "profile": profile},
+            ["agents", "task", "cwd"]))
+    if names:
+        tools.append(tool(
+            "delegate_agent",
+            "Hand a bounded task to another installed agent. Research mode is read-only. Implement mode creates a fresh Git worktree/branch and returns status and diff. It never merges or pushes; the current orchestrator reviews and integrates the result. Optionally select a model profile.",
+            {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}, "profile": profile},
+            ["agent", "task", "cwd", "mode"]))
+    return tools
 
 TOOLS = tools_for_host()
 
@@ -85,24 +212,31 @@ def validate_args(args, task_required=True):
         raise ValueError("cwd must be an existing folder")
     return task, path
 
-def cli_command(agent, task, mode):
+def cli_command(agent, task, mode, profile=None):
     if agent not in available_agents():
         raise ValueError("unknown agent: {}".format(agent))
+    if mode not in ("research", "implement"):
+        raise ValueError("unknown mode: {}".format(mode))
     binary = agent_binary(agent)
-    if agent == "agy":
-        return [binary, "--mode", "plan" if mode == "research" else "accept-edits", "--print=" + task]
-    if agent == "claude":
-        return [binary, "--permission-mode", "plan" if mode == "research" else "acceptEdits", "--print", "--", task]
-    args = [binary, "run", "--format", "default", "--agent", "plan" if mode == "research" else "build"]
-    if mode == "implement":
-        args.append("--auto")
-    return args + ["--", task]
+    spec = AGENTS[agent]
+    model = agent_model(agent, profile)
+    def expand(parts):
+        values = []
+        for part in parts:
+            value = str(part).replace("{task}", task).replace("{model}", model).replace("{agent}", agent).replace("{mode}", mode)
+            values.append(value)
+        return values
+    args = [binary] + expand(spec["args"][mode])
+    if model and spec.get("model_args"):
+        args.extend(expand(spec["model_args"]))
+    args.extend(expand(spec["task_args"][mode]))
+    return args
 
-def execute(agent, task, mode, cwd, timeout):
+def execute(agent, task, mode, cwd, timeout, profile=None):
     """Запускает группу процессов и не отдаёт дочернему процессу stdin MCP."""
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
-    process = subprocess.Popen(cli_command(agent, task, mode), cwd=cwd, env=env,
+    process = subprocess.Popen(cli_command(agent, task, mode, profile), cwd=cwd, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         start_new_session=True)
     ACTIVE_CHILD_GROUPS.add(process.pid)
@@ -139,12 +273,15 @@ def git(path, *args):
 def repo_root(path):
     return git(path, "rev-parse", "--show-toplevel").strip()
 
-def consultation_command(agent, task):
+def consultation_command(agent, task, profile=None):
     # Планировщик OpenCode работает для чтения; у Claude и agy есть явные режимы плана.
-    return cli_command(agent, task, "research")
+    return cli_command(agent, task, "research", profile)
 
 def consult(args):
     task, path = validate_args(args)
+    profile = args.get("profile")
+    if profile is not None and profile not in PROFILES:
+        raise ValueError("unknown model profile: {}".format(profile))
     agents = args.get("agents")
     if not isinstance(agents, list) or len(agents) < 2 or len(agents) > MAX_CONSULTANTS:
         raise ValueError("agents must contain two or three distinct names")
@@ -154,7 +291,7 @@ def consult(args):
     outputs = {}
     statuses = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
-        futures = {pool.submit(execute, a, prompt, "research", path, CONSULT_TIMEOUT): a for a in agents}
+        futures = {pool.submit(execute, a, prompt, "research", path, CONSULT_TIMEOUT, profile): a for a in agents}
         for future in concurrent.futures.as_completed(futures):
             agent = futures[future]
             try:
@@ -168,7 +305,7 @@ def consult(args):
     failed = all(code != 0 or timed_out for code, timed_out in statuses.values())
     return text_result(report, failed)
 
-def implement(agent, task, path):
+def implement(agent, task, path, profile=None):
     root = repo_root(path)
     relative_path = os.path.relpath(path, root)
     base = git(root, "rev-parse", "HEAD").strip()
@@ -183,7 +320,7 @@ def implement(agent, task, path):
         git(root, "worktree", "add", "-b", branch, worktree, base)
         agent_cwd = worktree if relative_path == "." else os.path.join(worktree, relative_path)
         os.makedirs(agent_cwd, exist_ok=True)
-        code, output, timed_out = execute(agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT)
+        code, output, timed_out = execute(agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT, profile)
         # intent-to-add включает новые файлы в возвращаемый diff.
         git(worktree, "add", "-N", "--", ".")
         status = git(worktree, "status", "--short", "--untracked-files=all").rstrip()
@@ -205,17 +342,25 @@ def implement(agent, task, path):
 
 def call_tool(name, args):
     if name == "agent_catalog":
-        return "Current orchestrator: {}. Available peer agents:\n".format(ORCHESTRATOR) + "\n".join("- {}: {}".format(k, v["label"]) for k, v in available_agents().items()) + "\n\nRoute by capability and configured model, not brand alone. Use agy for Google/Antigravity-specific questions, Claude for an independent critique or review, and OpenCode when its selected provider/model fits the task. Implement mode uses a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions."
+        agent_lines = []
+        for key, spec in available_agents().items():
+            model = agent_model(key)
+            agent_lines.append("- {}: {} (model: {})".format(key, spec["label"], model or "CLI default"))
+        profile_lines = ["- {}: {}".format(key, value.get("description", "custom model choices")) for key, value in sorted(PROFILES.items())]
+        return "Current orchestrator: {}. Available peer agents:\n{}\n\nModel profiles (default: {}):\n{}\n\nSelect a profile when delegating or consulting. The profile only overrides models explicitly configured for that agent; otherwise its preferred model or CLI default is used. Implementation runs in a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions.".format(ORCHESTRATOR, "\n".join(agent_lines) or "(none)", DEFAULT_PROFILE, "\n".join(profile_lines))
     task, path = validate_args(args)
     if name == "consult_agents":
         return consult(args)
     agent, mode = args.get("agent"), args.get("mode")
     if agent not in available_agents() or mode not in ("research", "implement"):
         raise ValueError("select an agent and mode research or implement")
+    profile = args.get("profile")
+    if profile is not None and profile not in PROFILES:
+        raise ValueError("unknown model profile: {}".format(profile))
     if mode == "implement":
-        report, okay = implement(agent, task, path)
+        report, okay = implement(agent, task, path, profile)
         return text_result(report, not okay)
-    code, output, timed_out = execute(agent, task, mode, path, CONSULT_TIMEOUT)
+    code, output, timed_out = execute(agent, task, mode, path, CONSULT_TIMEOUT, profile)
     return text_result("Agent: {}\nExit code: {}{}\n{}".format(agent, code, " (timed out)" if timed_out else "", output), code != 0 or timed_out)
 
 def handle(request):
@@ -233,7 +378,7 @@ def handle(request):
     if not isinstance(params, dict):
         rpc_error(msg_id, -32602, "params must be an object")
     elif method == "initialize":
-        result(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "agent-orchestrator", "version": "0.2.0"}})
+        result(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "agent-orchestrator", "version": "0.3.0"}})
     elif method == "ping":
         result(msg_id, {})
     elif method == "tools/list":

@@ -28,9 +28,9 @@ Restart the CLIs after registering. Whichever one you launch is the lead for tha
 
 ## What it does
 
-- **`agent_catalog`** lists supported command-line agents and routing guidance.
-- **`consult_agents`** asks two or three different agents for independent opinions at the same time, in their read-only planning modes.
-- **`delegate_agent`** runs one agent in research mode or implementation mode. Implementation starts from the repository's current `HEAD` in a new Git worktree.
+- **`agent_catalog`** lists available command-line agents, preferred models, and model profiles.
+- **`consult_agents`** asks two or three different agents for independent opinions at the same time, in their read-only planning modes; optionally select a model profile.
+- **`delegate_agent`** runs one agent in research mode or implementation mode. Implementation starts from the repository's current `HEAD` in a new Git worktree; optionally select a model profile.
 - **Review before integration.** The bridge returns the worktree path, branch, changed files, summary, diff, and the agent's response. It does not merge or push.
 - **Use existing logins.** The bridge starts the installed CLIs; it does not request, read, or store provider credentials itself.
 
@@ -42,14 +42,39 @@ This project is a terminal service with no graphical interface. Its use is shown
 
 ## Configuration
 
-Each CLI stores its own MCP connection. The commands above record an absolute script path and select the active lead with `AGENT_ORCHESTRATOR_HOST`. You can register only the CLIs you want to use. Codex-specific timeout and approval settings are:
+Each CLI stores its own MCP connection. The commands above record an absolute script path and select the active lead with `AGENT_ORCHESTRATOR_HOST`. Agent and model preferences are shared in `~/.config/agent-orchestrator/config.json`; the bridge reads this file when each CLI starts.
+
+Use `preferred_model` for one agent's normal model and named profiles to switch models per task. A missing model keeps the choice configured in that agent's own CLI. For example:
+
+```json
+{
+  "default_profile": "balanced",
+  "profiles": {
+    "balanced": {"description": "Normal choices", "models": {}},
+    "strong": {
+      "description": "Use the stronger model for difficult tasks",
+      "models": {
+        "claude": "sonnet",
+        "opencode": "provider/model-id"
+      }
+    }
+  },
+  "agents": {
+    "claude": {"preferred_model": "sonnet"}
+  }
+}
+```
+
+The leading agent can pass `profile: "strong"` to `delegate_agent` or `consult_agents`. To add a CLI, add an entry under `agents` with its executable, label, mode arguments and task arguments; the example in [the configuration guide](docs/configuration.md) shows the complete entry. Commands are passed as argument arrays without a shell. Restart the leading CLI after editing the file.
+
+Codex-specific timeout and approval settings go in `~/.codex/config.toml`:
 
 | Setting | Value | What it does |
 | --- | --- | --- |
 | `tool_timeout_sec` | `1000` | Leaves room for the bridge's 900-second implementation limit. |
 | `default_tools_approval_mode` | `"prompt"` | Asks before a model invokes a bridge tool. |
 
-The bridge searches `PATH` for `agy`, `claude`, and `opencode`. Override a path when needed with `AGY_BIN`, `CLAUDE_BIN`, or `OPENCODE_BIN` in the MCP server environment. The variable must point to an installed executable.
+The bridge searches `PATH` for configured executables. Override built-in paths with `AGY_BIN`, `CLAUDE_BIN`, or `OPENCODE_BIN`; custom agent `my-agent` can use `AGENT_ORCHESTRATOR_BIN_MY_AGENT`. The variable must point to an installed executable. Authentication remains in each CLI; the bridge passes a model only when one is set in the selected profile or as the agent's preference.
 
 | Bridge limit | Default | What it limits |
 | --- | --- | --- |
@@ -61,7 +86,7 @@ The bridge searches `PATH` for `agy`, `claude`, and `opencode`. Override a path 
 
 ## How it works
 
-The active host calls the bridge over MCP (Model Context Protocol) using standard input and output. The bridge starts each provider's own CLI, so authentication and model selection stay in that CLI. Consultation runs up to three child processes concurrently. Implementation records the base commit, creates a unique branch and worktree, runs one peer there, and returns the resulting state for the lead to review. See [the architecture guide](docs/architecture.md) for the flow and limits.
+The active host calls the bridge over MCP (Model Context Protocol) using standard input and output. The bridge starts each provider's own CLI, so authentication stays in that CLI. Consultation runs up to three child processes concurrently. Implementation records the base commit, creates a unique branch and worktree, runs one peer there, and returns the resulting state for the lead to review. See [the architecture guide](docs/architecture.md) for the flow and limits.
 
 ## Development
 

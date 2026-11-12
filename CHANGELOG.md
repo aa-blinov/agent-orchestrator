@@ -9,6 +9,7 @@ All notable changes to Agent Orchestrator. Versions are ordered newest first.
 - Added selectable MCP hosts through `AGENT_ORCHESTRATOR_HOST`.
 - Excluded the active host from peer tools to prevent recursive delegation.
 - Renamed the project and bridge to host-neutral names.
+- Added a shared JSON configuration for built-in and custom CLIs, preferred models, and per-task model profiles.
 
 ## 0.1.0 (2026)
 

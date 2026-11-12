@@ -27,7 +27,7 @@ Consultation starts up to three planning calls in a thread pool, each as a separ
 
 ### Keep provider authentication native
 
-Each agent CLI reads its own login and model configuration. The bridge only starts the executable and does not read or copy authentication files. The cost is that each CLI must already be installed and logged in.
+Each agent CLI reads its own login configuration. The bridge only starts the executable and does not read or copy authentication files. An optional model ID can be supplied from the shared model profile; otherwise the CLI's own model choice applies. The cost is that each CLI must already be installed and logged in.
 
 ### Use synchronous tools
 
@@ -45,5 +45,6 @@ Worktrees are created from the source repository's `HEAD`. Uncommitted changes a
 
 - The bridge must not merge, push, or delete a user's branch.
 - Provider credentials remain in their provider's CLI.
+- Agent commands and model preferences can be extended in `~/.config/agent-orchestrator/config.json` without editing the bridge.
 - The selected host is the integration owner; it reviews the returned diff and runs project checks.
 - The bridge has no hosted endpoint, telemetry, API key store, or network client of its own.
