@@ -22,9 +22,12 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(implementation, ["/bin/codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check", "--model", "gpt-6-luna", "--", "edit this"])
 
     def test_agy_receives_prompt_as_print_value(self):
-        with mock.patch.object(bridge, "agent_binary", return_value="/bin/agy"):
-            command = bridge.cli_command("agy", "--review this", "research")
-        self.assertEqual(command, ["/bin/agy", "--mode", "plan", "--model", "gemini-3.8-flash-high", "--print=--review this"])
+        agents = dict(bridge.AGENTS)
+        agents["agy"] = {key: value for key, value in agents["agy"].items() if key != "preferred_models"}
+        with mock.patch.object(bridge, "AGENTS", agents):
+            with mock.patch.object(bridge, "agent_binary", return_value="/bin/agy"):
+                command = bridge.cli_command("agy", "--review this", "research")
+        self.assertEqual(command, ["/bin/agy", "--mode", "plan", "--print=--review this"])
 
     def test_claude_prompt_is_after_option_separator(self):
         with mock.patch.object(bridge, "agent_binary", return_value="/bin/claude"):
