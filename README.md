@@ -31,6 +31,7 @@ Restart the CLIs after registering. Whichever one you launch is the lead for tha
 - **`agent_catalog`** lists available command-line agents, preferred models, and model profiles.
 - **`consult_agents`** asks two or three different agents for independent opinions at the same time, in their read-only planning modes; optionally select a model profile.
 - **`delegate_agent`** runs one agent in research mode or implementation mode. Implementation starts from the repository's current `HEAD` in a new Git worktree; optionally select a model profile.
+- **Token usage** is shown after each completed agent call when that CLI reports it. Parallel consultation also shows the sum of reported counts. Missing counts are marked as unavailable; the bridge does not estimate them or convert them to money.
 - **Review before integration.** The bridge returns the worktree path, branch, changed files, summary, diff, and the agent's response. It does not merge or push.
 - **Use existing logins.** The bridge starts the installed CLIs; it does not request, read, or store provider credentials itself.
 

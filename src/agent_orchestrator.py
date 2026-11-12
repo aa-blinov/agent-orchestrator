@@ -25,8 +25,8 @@ DEFAULT_AGENTS = {
         "env": "CODEX_BIN", "command": "codex", "label": "Codex CLI",
         "model_args": ["--model", "{model}"],
         "args": {
-            "research": ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check"],
-            "implement": ["exec", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check"],
+            "research": ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--json"],
+            "implement": ["exec", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json"],
         },
         "task_args": {"research": ["--", "{task}"], "implement": ["--", "{task}"]},
     },
@@ -34,8 +34,8 @@ DEFAULT_AGENTS = {
         "env": "AGY_BIN", "command": "agy", "label": "Antigravity CLI",
         "model_args": ["--model", "{model}"],
         "args": {
-            "research": ["--mode", "plan"],
-            "implement": ["--mode", "accept-edits"],
+            "research": ["--mode", "plan", "--output-format", "json"],
+            "implement": ["--mode", "accept-edits", "--output-format", "json"],
         },
         "task_args": {"research": ["--print={task}"], "implement": ["--print={task}"]},
     },
@@ -43,8 +43,8 @@ DEFAULT_AGENTS = {
         "env": "CLAUDE_BIN", "command": "claude", "label": "Claude Code",
         "model_args": ["--model", "{model}"],
         "args": {
-            "research": ["--permission-mode", "plan", "--print"],
-            "implement": ["--permission-mode", "acceptEdits", "--print"],
+            "research": ["--permission-mode", "plan", "--print", "--output-format", "json"],
+            "implement": ["--permission-mode", "acceptEdits", "--print", "--output-format", "json"],
         },
         "task_args": {"research": ["--", "{task}"], "implement": ["--", "{task}"]},
     },
@@ -52,8 +52,8 @@ DEFAULT_AGENTS = {
         "env": "OPENCODE_BIN", "command": "opencode", "label": "OpenCode",
         "model_args": ["--model", "{model}"],
         "args": {
-            "research": ["run", "--format", "default", "--agent", "plan"],
-            "implement": ["run", "--format", "default", "--agent", "build", "--auto"],
+            "research": ["run", "--format", "json", "--agent", "plan"],
+            "implement": ["run", "--format", "json", "--agent", "build", "--auto"],
         },
         "task_args": {"research": ["--", "{task}"], "implement": ["--", "{task}"]},
     },
@@ -248,6 +248,115 @@ def cli_command(agent, task, mode, profile=None):
     args.extend(expand(spec["task_args"][mode]))
     return args
 
+def json_events(output):
+    """Извлекает завершённые структурированные ответы из потока CLI."""
+    events = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            events.append(value)
+    if not events and output.lstrip().startswith("{"):
+        try:
+            value = json.loads(output)
+            if isinstance(value, dict):
+                events.append(value)
+        except ValueError:
+            pass
+    return events
+
+def normalized_usage(value):
+    """Приводит известные названия полей разных CLI к общей форме."""
+    if not isinstance(value, dict):
+        return None
+    aliases = {
+        "input_tokens": ("input_tokens", "total_input_tokens", "input"),
+        "output_tokens": ("output_tokens", "total_output_tokens", "output"),
+        "cached_input_tokens": ("cached_input_tokens", "cache_read_input_tokens", "cache_read_tokens"),
+        "cache_write_tokens": ("cache_creation_input_tokens", "cache_write_tokens"),
+        "reasoning_tokens": ("reasoning_output_tokens", "thinking_tokens", "reasoning"),
+        "total_tokens": ("total_tokens", "total"),
+    }
+    normalized = {}
+    for target, names in aliases.items():
+        for name in names:
+            candidate = value.get(name)
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate >= 0:
+                normalized[target] = int(candidate)
+                break
+    cache = value.get("cache")
+    if isinstance(cache, dict):
+        for key, target in (("read", "cached_input_tokens"), ("write", "cache_write_tokens")):
+            candidate = cache.get(key)
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate >= 0:
+                normalized[target] = int(candidate)
+    return normalized or None
+
+def extract_usage(agent, output):
+    """Возвращает человекочитаемый ответ и только те счётчики, что сообщил CLI."""
+    events = json_events(output)
+    usage = None
+    texts = []
+    if agent == "codex":
+        for event in events:
+            if event.get("type") == "turn.completed":
+                usage = normalized_usage(event.get("usage")) or usage
+            item = event.get("item", {})
+            if event.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+                if isinstance(item.get("text"), str):
+                    texts.append(item["text"])
+    elif agent in ("claude", "agy"):
+        for event in events:
+            usage = normalized_usage(event.get("usage")) or usage
+            text = event.get("result") if agent == "claude" else event.get("response")
+            if isinstance(text, str):
+                texts.append(text)
+    elif agent == "opencode":
+        step_usages = []
+        for event in events:
+            part = event.get("part", {})
+            if not isinstance(part, dict):
+                part = {}
+            if event.get("type") == "text" and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+            if event.get("type") == "step_finish":
+                found = normalized_usage(part.get("tokens") or event.get("tokens"))
+                if found:
+                    step_usages.append(found)
+        if step_usages:
+            usage = {}
+            for step in step_usages:
+                for key, count in step.items():
+                    usage[key] = usage.get(key, 0) + count
+    if usage is None:
+        # Codex may expose a total in its human-readable footer on older versions.
+        match = re.search(r"tokens used\s+([0-9][0-9 ,]*)", output, re.IGNORECASE)
+        if match:
+            usage = {"total_tokens": int(re.sub(r"[^0-9]", "", match.group(1)))}
+    if texts:
+        output = "\n".join(text.strip() for text in texts if text.strip())
+    return output, usage
+
+def usage_summary(usage):
+    if not usage:
+        return "Token usage: not reported by CLI."
+    labels = (("input_tokens", "input"), ("output_tokens", "output"),
+              ("cached_input_tokens", "cached input"), ("cache_write_tokens", "cache write"),
+              ("reasoning_tokens", "reasoning"), ("total_tokens", "total"))
+    fields = ["{} {}".format(usage[key], label) for key, label in labels if key in usage]
+    return "Token usage: {} (reported by CLI).".format(", ".join(fields))
+
+def add_usage(left, right):
+    total = dict(left or {})
+    for key, value in (right or {}).items():
+        total[key] = total.get(key, 0) + value
+    return total
+
 def execute(agent, task, mode, cwd, timeout, profile=None):
     """Запускает группу процессов и не отдаёт дочернему процессу stdin MCP."""
     env = os.environ.copy()
@@ -259,7 +368,8 @@ def execute(agent, task, mode, cwd, timeout, profile=None):
     try:
         raw, _ = process.communicate(timeout=timeout)
         output = raw.decode("utf-8", errors="replace")
-        return process.returncode, output[-MAX_OUTPUT:], False
+        output, usage = extract_usage(agent, output)
+        return process.returncode, output[-MAX_OUTPUT:], False, usage
     except subprocess.TimeoutExpired as exc:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -273,7 +383,8 @@ def execute(agent, task, mode, cwd, timeout, profile=None):
         partial = exc.output or b""
         if not isinstance(partial, str):
             partial = partial.decode("utf-8", errors="replace")
-        return 124, (partial[-MAX_OUTPUT:] + "\nTimed out after {} seconds; process group was stopped.".format(timeout)), True
+        partial, usage = extract_usage(agent, partial)
+        return 124, (partial[-MAX_OUTPUT:] + "\nTimed out after {} seconds; process group was stopped.".format(timeout)), True, usage
     finally:
         ACTIVE_CHILD_GROUPS.discard(process.pid)
 
@@ -302,22 +413,31 @@ def consult(args):
     if not isinstance(agents, list) or len(agents) < 2 or len(agents) > MAX_CONSULTANTS:
         raise ValueError("agents must contain two or three distinct names")
     if len(set(agents)) != len(agents) or any(a not in available_agents() for a in agents):
-        raise ValueError("agents must be distinct choices from agy, claude, opencode")
+        raise ValueError("agents must be distinct installed peer agents")
     prompt = task + "\n\nRead-only consultation: do not edit files or run commands that change project state. Give reasoning, risks, and a recommended approach."
     outputs = {}
     statuses = {}
+    usages = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
         futures = {pool.submit(execute, a, prompt, "research", path, CONSULT_TIMEOUT, profile): a for a in agents}
         for future in concurrent.futures.as_completed(futures):
             agent = futures[future]
             try:
-                code, body, timed_out = future.result()
+                code, body, timed_out, usage = future.result()
                 statuses[agent] = (code, timed_out)
-                outputs[agent] = "### {} — exit {}, {}\n{}".format(agent, code, "timed out" if timed_out else "done", body)
+                usages[agent] = usage
+                outputs[agent] = "### {} — exit {}, {}\n{}\n{}".format(agent, code, "timed out" if timed_out else "done", body, usage_summary(usage))
             except Exception as exc:
                 statuses[agent] = (1, False)
                 outputs[agent] = "### {} — launch error\n{}".format(agent, exc)
     report = "\n\n".join(outputs[a] for a in agents)
+    reported = [usage for usage in usages.values() if usage]
+    if reported:
+        combined = {}
+        for usage in reported:
+            combined = add_usage(combined, usage)
+        report += "\n\nCombined reported usage ({} of {} agents): {}".format(
+            len(reported), len(agents), usage_summary(combined).removeprefix("Token usage: ").removesuffix(" (reported by CLI)."))
     failed = all(code != 0 or timed_out for code, timed_out in statuses.values())
     return text_result(report, failed)
 
@@ -336,7 +456,7 @@ def implement(agent, task, path, profile=None):
         git(root, "worktree", "add", "-b", branch, worktree, base)
         agent_cwd = worktree if relative_path == "." else os.path.join(worktree, relative_path)
         os.makedirs(agent_cwd, exist_ok=True)
-        code, output, timed_out = execute(agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT, profile)
+        code, output, timed_out, usage = execute(agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT, profile)
         # intent-to-add включает новые файлы в возвращаемый diff.
         git(worktree, "add", "-N", "--", ".")
         status = git(worktree, "status", "--short", "--untracked-files=all").rstrip()
@@ -348,7 +468,7 @@ def implement(agent, task, path, profile=None):
         report = "Agent: {}\nExit code: {}{}\nWorktree: {}\nBranch: {}\nBase commit: {}\n".format(agent, code, " (timed out)" if timed_out else "", worktree, branch, base)
         if dirty:
             report += "Warning: source repository had uncommitted changes; they are not included in this worktree.\n"
-        report += "Changed paths:\n{}\n\nStatus:\n{}\n\nDiff summary:\n{}\n\nDiff:\n{}\n\nAgent response:\n{}".format("\n".join(names) or "(none)", status or "clean", stat or "(no diff)", diff or "(no diff)", output)
+        report += "Token usage: {}\nChanged paths:\n{}\n\nStatus:\n{}\n\nDiff summary:\n{}\n\nDiff:\n{}\n\nAgent response:\n{}".format(usage_summary(usage), "\n".join(names) or "(none)", status or "clean", stat or "(no diff)", diff or "(no diff)", output)
         return report, code == 0 and not timed_out
     except Exception as exc:
         # При ошибке Git после запуска сообщаем путь к сохранённой рабочей копии.
@@ -378,8 +498,8 @@ def call_tool(name, args):
     if mode == "implement":
         report, okay = implement(agent, task, path, profile)
         return text_result(report, not okay)
-    code, output, timed_out = execute(agent, task, mode, path, CONSULT_TIMEOUT, profile)
-    return text_result("Agent: {}\nExit code: {}{}\n{}".format(agent, code, " (timed out)" if timed_out else "", output), code != 0 or timed_out)
+    code, output, timed_out, usage = execute(agent, task, mode, path, CONSULT_TIMEOUT, profile)
+    return text_result("Agent: {}\nExit code: {}{}\n{}\n{}".format(agent, code, " (timed out)" if timed_out else "", output, usage_summary(usage)), code != 0 or timed_out)
 
 def handle(request):
     if not isinstance(request, dict):

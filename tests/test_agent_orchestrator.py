@@ -18,8 +18,8 @@ class CommandTests(unittest.TestCase):
                 with mock.patch.object(bridge, "agent_binary", return_value="/bin/codex"):
                     research = bridge.cli_command("codex", "inspect this", "research")
                     implementation = bridge.cli_command("codex", "edit this", "implement")
-        self.assertEqual(research, ["/bin/codex", "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--model", "gpt-6.1-terra", "--", "inspect this"])
-        self.assertEqual(implementation, ["/bin/codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check", "--model", "gpt-6-luna", "--", "edit this"])
+        self.assertEqual(research, ["/bin/codex", "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--json", "--model", "gpt-6.1-terra", "--", "inspect this"])
+        self.assertEqual(implementation, ["/bin/codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", "--model", "gpt-6-luna", "--", "edit this"])
 
     def test_agy_receives_prompt_as_print_value(self):
         agents = dict(bridge.AGENTS)
@@ -27,7 +27,7 @@ class CommandTests(unittest.TestCase):
         with mock.patch.object(bridge, "AGENTS", agents):
             with mock.patch.object(bridge, "agent_binary", return_value="/bin/agy"):
                 command = bridge.cli_command("agy", "--review this", "research")
-        self.assertEqual(command, ["/bin/agy", "--mode", "plan", "--print=--review this"])
+        self.assertEqual(command, ["/bin/agy", "--mode", "plan", "--output-format", "json", "--print=--review this"])
 
     def test_claude_prompt_is_after_option_separator(self):
         with mock.patch.object(bridge, "agent_binary", return_value="/bin/claude"):
@@ -102,6 +102,31 @@ class CommandTests(unittest.TestCase):
             with mock.patch.object(bridge, "agent_binary", return_value="/bin/my-agent"):
                 command = bridge.cli_command("my-agent", "task with spaces", "implement")
         self.assertEqual(command, ["/bin/my-agent", "--edit", "--model", "model-x", "--prompt", "task with spaces"])
+
+
+class UsageTests(unittest.TestCase):
+    def test_codex_json_stream_reports_usage_and_final_answer(self):
+        raw = '\n'.join([
+            '{"type":"item.completed","item":{"type":"agent_message","text":"READY"}}',
+            '{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":80,"output_tokens":15}}',
+        ])
+        answer, usage = bridge.extract_usage("codex", raw)
+        self.assertEqual(answer, "READY")
+        self.assertEqual(usage, {"input_tokens": 120, "output_tokens": 15, "cached_input_tokens": 80})
+
+    def test_claude_and_agy_json_usage(self):
+        claude, claude_usage = bridge.extract_usage("claude", '{"result":"Done","usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":7}}')
+        agy, agy_usage = bridge.extract_usage("agy", '{"response":"Done","usage":{"input_tokens":10,"output_tokens":4,"thinking_tokens":2,"total_tokens":14}}')
+        self.assertEqual((claude, claude_usage["cached_input_tokens"]), ("Done", 7))
+        self.assertEqual((agy, agy_usage["reasoning_tokens"], agy_usage["total_tokens"]), ("Done", 2, 14))
+
+    def test_opencode_step_usage_and_missing_usage_label(self):
+        raw = '{"type":"step_finish","part":{"tokens":{"input":30,"output":8,"reasoning":3,"cache":{"read":20,"write":1}}}}'
+        _, usage = bridge.extract_usage("opencode", raw)
+        self.assertEqual(usage["input_tokens"], 30)
+        self.assertEqual(usage["cached_input_tokens"], 20)
+        self.assertEqual(usage["reasoning_tokens"], 3)
+        self.assertIn("not reported", bridge.usage_summary(None))
 
 
 class ProtocolTests(unittest.TestCase):

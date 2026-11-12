@@ -32,6 +32,8 @@ Give each agent a separate model for `research` (complex analysis and consultati
 
 Replace the example identifiers with models available in the corresponding CLI. A model in the selected profile takes precedence over the role-specific `preferred_models`; the legacy `preferred_model` is a fallback for both roles. If neither is set, the bridge leaves model selection to the CLI. Codex CLI, Antigravity, and Claude Code accept their model identifier with `--model`; OpenCode uses its provider-qualified model identifier. Codex runs research in read-only mode and implementation with workspace-write access. See the [Codex CLI reference](https://developers.openai.com/codex/cli/reference), [Antigravity CLI guide](https://antigravity.google/docs/cli/headless/), [Claude Code CLI reference](https://docs.anthropic.com/en/docs/claude-code/cli-usage), and [OpenCode model guide](https://opencode.ai/docs/models/).
 
+The bridge requests structured output from each CLI and displays the input, output, cache, and reasoning token counts the CLI reports. Parallel consultation includes a sum of the reported counts. Providers expose different accounting fields, so the sum is a convenience for that set of calls, not a normalized billing total. If a CLI omits usage data, the result says so; no token counts or prices are estimated.
+
 The bridge includes a `native` profile when no configuration file exists. If the file exists, its `default_profile` must name one of the configured profiles. An omitted `profile` uses this default.
 
 ## Add a CLI agent

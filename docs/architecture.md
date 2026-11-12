@@ -23,6 +23,8 @@ Selected host CLI
 
 Consultation starts up to three planning calls in a thread pool, each as a separate process group. Implementation records the source repository's `HEAD`, creates a unique branch and worktree under `~/.agent-orchestrator/worktrees/`, then runs one agent in that worktree. New files are included by `git add -N` before the bridge collects the diff.
 
+Each CLI runs in its machine-readable output mode where available. The bridge extracts its reported token usage and keeps the final answer; absent usage fields are reported as unavailable. Provider counters can differ in how they account for cache and reasoning tokens, so combined consultation counts are informational and are not converted to cost.
+
 ## Decisions worth knowing about
 
 ### Keep provider authentication native
