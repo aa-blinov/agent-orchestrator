@@ -24,6 +24,13 @@ AGENTS = {
     "opencode": {"env": "OPENCODE_BIN", "command": "opencode", "label": "OpenCode (model/provider configured in OpenCode)"},
 }
 
+# The host that loaded this MCP server is the orchestrator. Excluding it avoids
+# recursive calls while leaving every other installed CLI available.
+ORCHESTRATOR = os.environ.get("AGENT_ORCHESTRATOR_HOST", "generic").strip().lower() or "generic"
+
+def available_agents():
+    return {name: spec for name, spec in AGENTS.items() if name != ORCHESTRATOR}
+
 def agent_binary(agent):
     """Находит CLI по переопределению или в текущем PATH."""
     spec = AGENTS[agent]
@@ -35,11 +42,16 @@ def agent_binary(agent):
 def tool(name, description, properties, required):
     return {"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}}
 
-TOOLS = [
+def tools_for_host():
+    agents = available_agents()
+    names = list(agents)
+    return [
     tool("agent_catalog", "Show available coding harnesses and how to choose among them. Does not start an agent.", {}, []),
-    tool("consult_agents", "Ask up to three agents in parallel for independent read-only opinions. Use for hard tradeoffs, architecture, uncertain root causes, or a second review. No agent should edit files.", {"agents": {"type": "array", "items": {"type": "string", "enum": list(AGENTS)}, "minItems": 2, "maxItems": MAX_CONSULTANTS}, "task": {"type": "string"}, "cwd": {"type": "string"}}, ["agents", "task", "cwd"]),
-    tool("delegate_agent", "Hand a bounded implementation task to one agent. Research mode is read-only. Implement mode creates a fresh Git worktree/branch, runs the agent there, then returns status, changed paths, diff summary, and a bounded diff. It never merges or pushes. Codex must review and integrate the result.", {"agent": {"type": "string", "enum": list(AGENTS)}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}}, ["agent", "task", "cwd", "mode"]),
-]
+    tool("consult_agents", "Ask up to three other agents in parallel for independent read-only opinions. Use for hard tradeoffs, architecture, uncertain root causes, or a second review. The current orchestrator is excluded.", {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}}, ["agents", "task", "cwd"]),
+    tool("delegate_agent", "Hand a bounded task to another installed agent. Research mode is read-only. Implement mode creates a fresh Git worktree/branch and returns status and diff. It never merges or pushes; the current orchestrator reviews and integrates the result.", {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}}, ["agent", "task", "cwd", "mode"]),
+    ]
+
+TOOLS = tools_for_host()
 
 def rpc_error(msg_id, code, message, data=None):
     err = {"code": code, "message": message}
@@ -74,7 +86,7 @@ def validate_args(args, task_required=True):
     return task, path
 
 def cli_command(agent, task, mode):
-    if agent not in AGENTS:
+    if agent not in available_agents():
         raise ValueError("unknown agent: {}".format(agent))
     binary = agent_binary(agent)
     if agent == "agy":
@@ -136,7 +148,7 @@ def consult(args):
     agents = args.get("agents")
     if not isinstance(agents, list) or len(agents) < 2 or len(agents) > MAX_CONSULTANTS:
         raise ValueError("agents must contain two or three distinct names")
-    if len(set(agents)) != len(agents) or any(a not in AGENTS for a in agents):
+    if len(set(agents)) != len(agents) or any(a not in available_agents() for a in agents):
         raise ValueError("agents must be distinct choices from agy, claude, opencode")
     prompt = task + "\n\nRead-only consultation: do not edit files or run commands that change project state. Give reasoning, risks, and a recommended approach."
     outputs = {}
@@ -163,10 +175,10 @@ def implement(agent, task, path):
     dirty = git(root, "status", "--porcelain", "--untracked-files=all").strip()
     stamp = time.strftime("%Y%m%d-%H%M%S")
     unique = uuid.uuid4().hex[:8]
-    branch = "codex-agent/{}-{}-{}".format(agent, stamp, unique)
-    worktree = os.path.join(HOME, ".codex", "agent-worktrees", os.path.basename(root) + "-" + stamp + "-" + unique)
+    branch = "agent-orchestrator/{}-{}-{}".format(agent, stamp, unique)
+    worktree = os.path.join(HOME, ".agent-orchestrator", "worktrees", os.path.basename(root) + "-" + stamp + "-" + unique)
     os.makedirs(os.path.dirname(worktree), exist_ok=True)
-    augmented = task + "\n\nWork in this worktree only. Do not push, merge, or alter other worktrees. Do not commit; leave changes for Codex to review. Summarize implementation and checks."
+    augmented = task + "\n\nWork in this worktree only. Do not push, merge, or alter other worktrees. Do not commit; leave changes for the orchestrator to review. Summarize implementation and checks."
     try:
         git(root, "worktree", "add", "-b", branch, worktree, base)
         agent_cwd = worktree if relative_path == "." else os.path.join(worktree, relative_path)
@@ -193,12 +205,12 @@ def implement(agent, task, path):
 
 def call_tool(name, args):
     if name == "agent_catalog":
-        return "Available agents:\n" + "\n".join("- {}: {}".format(k, v["label"]) for k, v in AGENTS.items()) + "\n\nRoute by capability and configured model, not brand alone. Use agy for Google/Antigravity-specific questions, Claude for an independent critique or review, and OpenCode when its selected provider/model fits the task. Implement mode uses a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions."
+        return "Current orchestrator: {}. Available peer agents:\n".format(ORCHESTRATOR) + "\n".join("- {}: {}".format(k, v["label"]) for k, v in available_agents().items()) + "\n\nRoute by capability and configured model, not brand alone. Use agy for Google/Antigravity-specific questions, Claude for an independent critique or review, and OpenCode when its selected provider/model fits the task. Implement mode uses a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions."
     task, path = validate_args(args)
     if name == "consult_agents":
         return consult(args)
     agent, mode = args.get("agent"), args.get("mode")
-    if agent not in AGENTS or mode not in ("research", "implement"):
+    if agent not in available_agents() or mode not in ("research", "implement"):
         raise ValueError("select an agent and mode research or implement")
     if mode == "implement":
         report, okay = implement(agent, task, path)
@@ -221,11 +233,11 @@ def handle(request):
     if not isinstance(params, dict):
         rpc_error(msg_id, -32602, "params must be an object")
     elif method == "initialize":
-        result(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "codex-agent-bridge", "version": "0.1.0"}})
+        result(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}}, "serverInfo": {"name": "agent-orchestrator", "version": "0.2.0"}})
     elif method == "ping":
         result(msg_id, {})
     elif method == "tools/list":
-        result(msg_id, {"tools": TOOLS})
+        result(msg_id, {"tools": tools_for_host()})
     elif method == "tools/call":
         name = params.get("name")
         if not isinstance(name, str) or name not in {t["name"] for t in TOOLS}:

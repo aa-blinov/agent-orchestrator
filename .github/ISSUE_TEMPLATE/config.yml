@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Question or discussion
-    url: https://github.com/aa-blinov/codex-agent-orchestrator/discussions
+    url: https://github.com/aa-blinov/agent-orchestrator/discussions
     about: Ask anything that is not a bug or a feature request.
   - name: Security vulnerability
-    url: https://github.com/aa-blinov/codex-agent-orchestrator/security/advisories/new
+    url: https://github.com/aa-blinov/agent-orchestrator/security/advisories/new
     about: Report a vulnerability privately. Do not open a public issue.

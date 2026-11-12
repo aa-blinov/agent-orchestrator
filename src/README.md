@@ -1,3 +1,3 @@
 # Source
 
-The bridge lives in `codex_agent_bridge.py` so Codex can start the file directly without installing a package. It uses only the Python standard library.
+The bridge lives in `agent_orchestrator.py` so an MCP host can start it directly without installing a package. It uses only the Python standard library.

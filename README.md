@@ -1,6 +1,6 @@
-# Codex agent orchestrator
+# Agent orchestrator
 
-Route bounded tasks from Codex CLI to Antigravity, Claude Code, and OpenCode, ask independent agents for parallel advice, and review implementation changes in a separate Git worktree.
+Use Codex, Antigravity, Claude Code, or OpenCode as the orchestrator. The active orchestrator can route bounded tasks to its peers, ask for parallel advice, and review implementation changes in a separate Git worktree.
 
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -8,20 +8,23 @@ Route bounded tasks from Codex CLI to Antigravity, Claude Code, and OpenCode, as
 
 ## Quick start
 
-Install Python 3.9 or newer, [Codex CLI](https://github.com/openai/codex), and at least one supported coding agent. From the repository directory, add the bridge to Codex:
+Install Python 3.9 or newer and the coding CLIs you want to use. Register the same bridge with each orchestrator you want to switch between. Run these commands from this repository directory:
 
 ```bash
-codex mcp add local-agents -- python3 "$PWD/src/codex_agent_bridge.py"
+codex mcp add --env AGENT_ORCHESTRATOR_HOST=codex local-agents -- python3 "$PWD/src/agent_orchestrator.py"
+agy mcp add --env AGENT_ORCHESTRATOR_HOST=agy local-agents python3 "$PWD/src/agent_orchestrator.py"
+claude mcp add --scope user --env AGENT_ORCHESTRATOR_HOST=claude local-agents -- python3 "$PWD/src/agent_orchestrator.py"
+opencode mcp add local-agents --global --env AGENT_ORCHESTRATOR_HOST=opencode -- python3 "$PWD/src/agent_orchestrator.py"
 ```
 
-Then add these settings to `~/.codex/config.toml` under `[mcp_servers.local-agents]`:
+For Codex, timeout and approval settings go in `~/.codex/config.toml` under `[mcp_servers.local-agents]`:
 
 ```toml
 tool_timeout_sec = 1000
 default_tools_approval_mode = "prompt"
 ```
 
-Restart Codex CLI. Ask Codex to delegate a bounded task or request a second opinion. For implementation, the bridge creates a new branch and worktree and returns a diff; Codex reviews and integrates it.
+Restart the CLIs after registering. Whichever one you launch is the lead for that session. It can delegate bounded work or ask peers for a second opinion. The bridge removes the active lead from its own peer list to prevent recursive calls. For implementation, it creates a new branch and worktree and returns a diff; the lead reviews and integrates it.
 
 ## What it does
 
@@ -39,7 +42,7 @@ This project is a terminal service with no graphical interface. Its use is shown
 
 ## Configuration
 
-Codex stores the MCP connection in `~/.codex/config.toml`. The command above records an absolute script path. Set the per-server timeout and approval behavior:
+Each CLI stores its own MCP connection. The commands above record an absolute script path and select the active lead with `AGENT_ORCHESTRATOR_HOST`. You can register only the CLIs you want to use. Codex-specific timeout and approval settings are:
 
 | Setting | Value | What it does |
 | --- | --- | --- |
@@ -58,7 +61,7 @@ The bridge searches `PATH` for `agy`, `claude`, and `opencode`. Override a path 
 
 ## How it works
 
-Codex calls the bridge over MCP (Model Context Protocol) using standard input and output. The bridge starts each provider's own CLI, so authentication and model selection stay in that CLI. Consultation runs up to three child processes concurrently. Implementation records the base commit, creates a unique branch and worktree, runs one agent there, and returns the resulting state for Codex to review. See [the architecture guide](docs/architecture.md) for the flow and limits.
+The active host calls the bridge over MCP (Model Context Protocol) using standard input and output. The bridge starts each provider's own CLI, so authentication and model selection stay in that CLI. Consultation runs up to three child processes concurrently. Implementation records the base commit, creates a unique branch and worktree, runs one peer there, and returns the resulting state for the lead to review. See [the architecture guide](docs/architecture.md) for the flow and limits.
 
 ## Development
 

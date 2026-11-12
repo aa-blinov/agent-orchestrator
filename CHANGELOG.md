@@ -1,12 +1,14 @@
 # Changelog
 
-All notable changes to Codex Agent Orchestrator. Versions are ordered newest first.
+All notable changes to Agent Orchestrator. Versions are ordered newest first.
 
 ## [Unreleased]
 
 ### Added
 
-- Nothing yet.
+- Added selectable MCP hosts through `AGENT_ORCHESTRATOR_HOST`.
+- Excluded the active host from peer tools to prevent recursive delegation.
+- Renamed the project and bridge to host-neutral names.
 
 ## 0.1.0 (2026)
 

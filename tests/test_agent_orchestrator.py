@@ -4,7 +4,7 @@ import json
 import unittest
 from unittest import mock
 
-from src import codex_agent_bridge as bridge
+from src import agent_orchestrator as bridge
 
 
 class CommandTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_initialize_advertises_server(self):
         response = self.call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})[0]
-        self.assertEqual(response["result"]["serverInfo"]["name"], "codex-agent-bridge")
+        self.assertEqual(response["result"]["serverInfo"]["name"], "agent-orchestrator")
 
     def test_invalid_tool_name_returns_json_rpc_error(self):
         response = self.call({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": []}})[0]
@@ -49,6 +49,13 @@ class ProtocolTests(unittest.TestCase):
     def test_notification_has_no_response(self):
         response = self.call({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.assertEqual(response, [])
+
+    def test_host_orchestrator_is_excluded_from_tools(self):
+        with mock.patch.object(bridge, "ORCHESTRATOR", "claude"):
+            tools = bridge.tools_for_host()
+        delegate = next(item for item in tools if item["name"] == "delegate_agent")
+        self.assertNotIn("claude", delegate["inputSchema"]["properties"]["agent"]["enum"])
+        self.assertIn("agy", delegate["inputSchema"]["properties"]["agent"]["enum"])
 
 
 if __name__ == "__main__":

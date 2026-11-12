@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking at Codex Agent Orchestrator.
+Thanks for looking at Agent Orchestrator.
 
 ## Before you open a pull request
 
