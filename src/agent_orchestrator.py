@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -61,6 +62,8 @@ DEFAULT_AGENTS = {
 
 CONFIG_ROOT = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
 CONFIG_PATH = os.path.join(CONFIG_ROOT, "agent-orchestrator", "config.json")
+DATA_ROOT = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+USAGE_DB = os.path.join(DATA_ROOT, "agent-orchestrator", "usage.sqlite3")
 
 def load_settings(path=CONFIG_PATH):
     """Загружает настройки пользователей, не требуя их для штатного запуска."""
@@ -151,6 +154,51 @@ ORCHESTRATOR = os.environ.get("AGENT_ORCHESTRATOR_HOST", "generic").strip().lowe
 def available_agents():
     return {name: spec for name, spec in AGENTS.items() if name != ORCHESTRATOR}
 
+def resolve_task_id(value=None):
+    if value is None or value == "":
+        return "task-{}-{}".format(time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), uuid.uuid4().hex[:8])
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value):
+        raise ValueError("task_id must be 1-128 letters, numbers, dots, underscores, colons, or hyphens")
+    return value
+
+def store_usage(task_id, agent, model, mode, exit_code, timed_out, duration, usage, path=None):
+    """Сохраняет только метаданные вызова и сообщённые CLI счётчики; текст задачи не сохраняется."""
+    path = path or USAGE_DB
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    values = usage or {}
+    with sqlite3.connect(path, timeout=10) as database:
+        database.execute("""CREATE TABLE IF NOT EXISTS agent_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            model TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            exit_code INTEGER NOT NULL,
+            timed_out INTEGER NOT NULL,
+            duration_seconds REAL NOT NULL,
+            usage_reported INTEGER NOT NULL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            reasoning_tokens INTEGER,
+            total_tokens INTEGER
+        )""")
+        database.execute("CREATE INDEX IF NOT EXISTS idx_agent_calls_task_id ON agent_calls(task_id)")
+        database.execute("""INSERT INTO agent_calls (
+            task_id, agent, model, mode, created_at, exit_code, timed_out, duration_seconds,
+            usage_reported, input_tokens, output_tokens, cached_input_tokens,
+            cache_write_tokens, reasoning_tokens, total_tokens
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            task_id, agent, model, mode, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            int(exit_code), int(timed_out), round(duration, 3), int(bool(usage)),
+            values.get("input_tokens"), values.get("output_tokens"),
+            values.get("cached_input_tokens"), values.get("cache_write_tokens"),
+            values.get("reasoning_tokens"), values.get("total_tokens"),
+        ))
+    os.chmod(path, 0o600)
+
 def agent_binary(agent):
     """Находит CLI по переопределению или в текущем PATH."""
     spec = AGENTS[agent]
@@ -179,18 +227,23 @@ def tools_for_host():
     agents = available_agents()
     names = list(agents)
     profile = profile_schema()
-    tools = [tool("agent_catalog", "Show available coding agents, preferred models, and model profiles.", {}, [])]
+    tools = [
+        tool("agent_catalog", "Show available coding agents, preferred models, and model profiles.", {}, []),
+        tool("usage_report", "Read locally stored token usage by task and agent. Pass the same task_id to group related agent calls. Metrics stay out of ordinary delegation responses.",
+             {"task_id": {"type": "string", "description": "Optional task group identifier; omitted lists recent task groups."},
+              "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}}, []),
+    ]
     if len(names) >= 2:
         tools.append(tool(
             "consult_agents",
-            "Ask up to three other agents in parallel for independent read-only opinions. Use for hard tradeoffs, architecture, uncertain root causes, or a second review. The current orchestrator is excluded. Optionally select a model profile.",
-            {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}, "profile": profile},
+            "Ask up to three other agents in parallel for independent read-only opinions. Use for hard tradeoffs, architecture, uncertain root causes, or a second review. The current orchestrator is excluded. Reuse task_id to group these calls with other calls for the same task. Optionally select a model profile.",
+            {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}, "profile": profile, "task_id": {"type": "string"}},
             ["agents", "task", "cwd"]))
     if names:
         tools.append(tool(
             "delegate_agent",
-            "Hand a bounded task to another installed agent. Research mode is read-only. Implement mode creates a fresh Git worktree/branch and returns status and diff. It never merges or pushes; the current orchestrator reviews and integrates the result. Optionally select a model profile.",
-            {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}, "profile": profile},
+            "Hand a bounded task to another installed agent. Research mode is read-only. Implement mode creates a fresh Git worktree/branch and returns status and diff. It never merges or pushes; the current orchestrator reviews and integrates the result. Reuse task_id to group multiple calls for one task. Optionally select a model profile.",
+            {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}, "profile": profile, "task_id": {"type": "string"}},
             ["agent", "task", "cwd", "mode"]))
     return tools
 
@@ -351,25 +404,77 @@ def usage_summary(usage):
     fields = ["{} {}".format(usage[key], label) for key, label in labels if key in usage]
     return "Token usage: {} (reported by CLI).".format(", ".join(fields))
 
-def add_usage(left, right):
-    total = dict(left or {})
-    for key, value in (right or {}).items():
-        total[key] = total.get(key, 0) + value
-    return total
+def usage_report(args):
+    if not isinstance(args, dict):
+        raise ValueError("arguments must be an object")
+    task_id = resolve_task_id(args.get("task_id")) if args.get("task_id") else None
+    limit = args.get("limit", 20)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer from 1 to 100")
+    if not os.path.isfile(USAGE_DB):
+        return "No usage records yet. Records are stored locally at {}.".format(USAGE_DB)
+    fields = ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens")
+    with sqlite3.connect(USAGE_DB, timeout=10) as database:
+        database.row_factory = sqlite3.Row
+        if task_id:
+            rows = database.execute("SELECT * FROM agent_calls WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
+            if not rows:
+                return "No usage records found for task_id {}.".format(task_id)
+            report = ["Usage for task_id {} ({} calls; cache reads are shown separately from input):".format(task_id, len(rows))]
+            for row in rows:
+                usage = {key: row[key] for key in fields if row[key] is not None}
+                report.append("- {} | {} | {} / {} | exit {}{} | {:.1f}s | {}".format(
+                    row["created_at"], row["agent"], row["mode"], row["model"], row["exit_code"],
+                    " / timed out" if row["timed_out"] else "", row["duration_seconds"],
+                    usage_summary(usage) if row["usage_reported"] else "Token usage: not reported by CLI."))
+            totals = {key: sum(row[key] or 0 for row in rows) for key in fields}
+            available = {key: totals[key] for key in fields if any(row[key] is not None for row in rows)}
+            report.append("Combined reported counters ({} of {} calls): {}".format(
+                sum(row["usage_reported"] for row in rows), len(rows), usage_summary(available)))
+            report.append("Cached input is a subset reported separately; do not add it again to input tokens.")
+            return "\n".join(report)
+        rows = database.execute("""SELECT task_id, MIN(created_at) AS first_seen, COUNT(*) AS calls,
+            SUM(usage_reported) AS reported_calls,
+            SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+            SUM(cached_input_tokens) AS cached_input_tokens, SUM(cache_write_tokens) AS cache_write_tokens,
+            SUM(reasoning_tokens) AS reasoning_tokens, SUM(total_tokens) AS total_tokens,
+            MAX(id) AS last_id FROM agent_calls GROUP BY task_id ORDER BY last_id DESC LIMIT ?""", (limit,)).fetchall()
+    if not rows:
+        return "No usage records yet."
+    report = ["Recent task usage (cache reads are shown separately from input):"]
+    for row in rows:
+        usage = {key: row[key] for key in fields if row[key] is not None}
+        report.append("- {} | task_id={} | {} calls, {} reported | {}".format(
+            row["first_seen"], row["task_id"], row["calls"], row["reported_calls"],
+            usage_summary(usage) if usage else "Token usage: not reported by CLI."))
+    report.append("Pass a task_id to inspect its individual calls. Records are stored locally at {}.".format(USAGE_DB))
+    return "\n".join(report)
 
-def execute(agent, task, mode, cwd, timeout, profile=None):
+def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None):
     """Запускает группу процессов и не отдаёт дочернему процессу stdin MCP."""
+    started = time.monotonic()
+    task_id = resolve_task_id(task_id)
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
     process = subprocess.Popen(cli_command(agent, task, mode, profile), cwd=cwd, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         start_new_session=True)
     ACTIVE_CHILD_GROUPS.add(process.pid)
+    def finish(code, output, timed_out):
+        output, usage = extract_usage(agent, output)
+        saved = True
+        try:
+            store_usage(task_id, agent, agent_model(agent, profile, mode) or "cli-default", mode,
+                        code, timed_out, time.monotonic() - started, usage)
+        except Exception as exc:
+            saved = False
+            sys.stderr.write("agent-orchestrator: unable to save usage metrics: {}\n".format(exc))
+            sys.stderr.flush()
+        return code, output[-MAX_OUTPUT:], timed_out, usage, saved
     try:
         raw, _ = process.communicate(timeout=timeout)
         output = raw.decode("utf-8", errors="replace")
-        output, usage = extract_usage(agent, output)
-        return process.returncode, output[-MAX_OUTPUT:], False, usage
+        return finish(process.returncode, output, False)
     except subprocess.TimeoutExpired as exc:
         try:
             os.killpg(process.pid, signal.SIGTERM)
@@ -383,8 +488,7 @@ def execute(agent, task, mode, cwd, timeout, profile=None):
         partial = exc.output or b""
         if not isinstance(partial, str):
             partial = partial.decode("utf-8", errors="replace")
-        partial, usage = extract_usage(agent, partial)
-        return 124, (partial[-MAX_OUTPUT:] + "\nTimed out after {} seconds; process group was stopped.".format(timeout)), True, usage
+        return finish(124, partial + "\nTimed out after {} seconds; process group was stopped.".format(timeout), True)
     finally:
         ACTIVE_CHILD_GROUPS.discard(process.pid)
 
@@ -406,6 +510,7 @@ def consultation_command(agent, task, profile=None):
 
 def consult(args):
     task, path = validate_args(args)
+    task_id = resolve_task_id(args.get("task_id"))
     profile = args.get("profile")
     if profile is not None and profile not in PROFILES:
         raise ValueError("unknown model profile: {}".format(profile))
@@ -417,31 +522,25 @@ def consult(args):
     prompt = task + "\n\nRead-only consultation: do not edit files or run commands that change project state. Give reasoning, risks, and a recommended approach."
     outputs = {}
     statuses = {}
-    usages = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents)) as pool:
-        futures = {pool.submit(execute, a, prompt, "research", path, CONSULT_TIMEOUT, profile): a for a in agents}
+        futures = {pool.submit(execute, a, prompt, "research", path, CONSULT_TIMEOUT, profile, task_id): a for a in agents}
         for future in concurrent.futures.as_completed(futures):
             agent = futures[future]
             try:
-                code, body, timed_out, usage = future.result()
+                code, body, timed_out, usage, saved = future.result()
                 statuses[agent] = (code, timed_out)
-                usages[agent] = usage
-                outputs[agent] = "### {} — exit {}, {}\n{}\n{}".format(agent, code, "timed out" if timed_out else "done", body, usage_summary(usage))
+                outputs[agent] = "### {} — exit {}, {}; usage record {}\n{}".format(
+                    agent, code, "timed out" if timed_out else "done", "saved" if saved else "not saved", body)
             except Exception as exc:
                 statuses[agent] = (1, False)
                 outputs[agent] = "### {} — launch error\n{}".format(agent, exc)
     report = "\n\n".join(outputs[a] for a in agents)
-    reported = [usage for usage in usages.values() if usage]
-    if reported:
-        combined = {}
-        for usage in reported:
-            combined = add_usage(combined, usage)
-        report += "\n\nCombined reported usage ({} of {} agents): {}".format(
-            len(reported), len(agents), usage_summary(combined).removeprefix("Token usage: ").removesuffix(" (reported by CLI)."))
+    report = "Task ID: {} (usage saved locally)\n\n{}".format(task_id, report)
     failed = all(code != 0 or timed_out for code, timed_out in statuses.values())
     return text_result(report, failed)
 
-def implement(agent, task, path, profile=None):
+def implement(agent, task, path, profile=None, task_id=None):
+    task_id = resolve_task_id(task_id)
     root = repo_root(path)
     relative_path = os.path.relpath(path, root)
     base = git(root, "rev-parse", "HEAD").strip()
@@ -456,7 +555,7 @@ def implement(agent, task, path, profile=None):
         git(root, "worktree", "add", "-b", branch, worktree, base)
         agent_cwd = worktree if relative_path == "." else os.path.join(worktree, relative_path)
         os.makedirs(agent_cwd, exist_ok=True)
-        code, output, timed_out, usage = execute(agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT, profile)
+        code, output, timed_out, usage, saved = execute(agent, augmented, "implement", agent_cwd, DELEGATE_TIMEOUT, profile, task_id)
         # intent-to-add включает новые файлы в возвращаемый diff.
         git(worktree, "add", "-N", "--", ".")
         status = git(worktree, "status", "--short", "--untracked-files=all").rstrip()
@@ -468,7 +567,7 @@ def implement(agent, task, path, profile=None):
         report = "Agent: {}\nExit code: {}{}\nWorktree: {}\nBranch: {}\nBase commit: {}\n".format(agent, code, " (timed out)" if timed_out else "", worktree, branch, base)
         if dirty:
             report += "Warning: source repository had uncommitted changes; they are not included in this worktree.\n"
-        report += "Token usage: {}\nChanged paths:\n{}\n\nStatus:\n{}\n\nDiff summary:\n{}\n\nDiff:\n{}\n\nAgent response:\n{}".format(usage_summary(usage), "\n".join(names) or "(none)", status or "clean", stat or "(no diff)", diff or "(no diff)", output)
+        report += "Task ID: {} (usage record {})\nChanged paths:\n{}\n\nStatus:\n{}\n\nDiff summary:\n{}\n\nDiff:\n{}\n\nAgent response:\n{}".format(task_id, "saved" if saved else "not saved", "\n".join(names) or "(none)", status or "clean", stat or "(no diff)", diff or "(no diff)", output)
         return report, code == 0 and not timed_out
     except Exception as exc:
         # При ошибке Git после запуска сообщаем путь к сохранённой рабочей копии.
@@ -486,6 +585,8 @@ def call_tool(name, args):
                 key, spec["label"], research_model, implement_model))
         profile_lines = ["- {}: {}".format(key, value.get("description", "custom model choices")) for key, value in sorted(PROFILES.items())]
         return "Current orchestrator: {}. Available peer agents:\n{}\n\nModel profiles (default: {}):\n{}\n\nEach agent can use a separate preferred model for research/complex reasoning and implementation. A selected profile overrides those role preferences; when no model is configured, the CLI's own default is used. Implementation runs in a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions.".format(ORCHESTRATOR, "\n".join(agent_lines) or "(none)", DEFAULT_PROFILE, "\n".join(profile_lines))
+    if name == "usage_report":
+        return usage_report(args)
     task, path = validate_args(args)
     if name == "consult_agents":
         return consult(args)
@@ -496,10 +597,12 @@ def call_tool(name, args):
     if profile is not None and profile not in PROFILES:
         raise ValueError("unknown model profile: {}".format(profile))
     if mode == "implement":
-        report, okay = implement(agent, task, path, profile)
+        task_id = resolve_task_id(args.get("task_id"))
+        report, okay = implement(agent, task, path, profile, task_id)
         return text_result(report, not okay)
-    code, output, timed_out, usage = execute(agent, task, mode, path, CONSULT_TIMEOUT, profile)
-    return text_result("Agent: {}\nExit code: {}{}\n{}\n{}".format(agent, code, " (timed out)" if timed_out else "", output, usage_summary(usage)), code != 0 or timed_out)
+    task_id = resolve_task_id(args.get("task_id"))
+    code, output, timed_out, usage, saved = execute(agent, task, mode, path, CONSULT_TIMEOUT, profile, task_id)
+    return text_result("Task ID: {} (usage record {})\nAgent: {}\nExit code: {}{}\n{}".format(task_id, "saved" if saved else "not saved", agent, code, " (timed out)" if timed_out else "", output), code != 0 or timed_out)
 
 def handle(request):
     if not isinstance(request, dict):
