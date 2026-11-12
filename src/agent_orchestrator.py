@@ -21,6 +21,15 @@ MAX_CONSULTANTS = 3
 ACTIVE_CHILD_GROUPS = set()
 
 DEFAULT_AGENTS = {
+    "codex": {
+        "env": "CODEX_BIN", "command": "codex", "label": "Codex CLI",
+        "model_args": ["--model", "{model}"],
+        "args": {
+            "research": ["exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check"],
+            "implement": ["exec", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check"],
+        },
+        "task_args": {"research": ["--", "{task}"], "implement": ["--", "{task}"]},
+    },
     "agy": {
         "env": "AGY_BIN", "command": "agy", "label": "Antigravity CLI",
         "model_args": ["--model", "{model}"],

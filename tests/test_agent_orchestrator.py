@@ -10,10 +10,21 @@ from src import agent_orchestrator as bridge
 
 
 class CommandTests(unittest.TestCase):
+    def test_codex_uses_separate_models_and_restricted_modes(self):
+        agents = dict(bridge.AGENTS)
+        agents["codex"] = dict(agents["codex"], preferred_models={"research": "gpt-6.1-terra", "implement": "gpt-6-luna"})
+        with mock.patch.object(bridge, "AGENTS", agents):
+            with mock.patch.object(bridge, "PROFILES", {"native": {"models": {}}}):
+                with mock.patch.object(bridge, "agent_binary", return_value="/bin/codex"):
+                    research = bridge.cli_command("codex", "inspect this", "research")
+                    implementation = bridge.cli_command("codex", "edit this", "implement")
+        self.assertEqual(research, ["/bin/codex", "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--model", "gpt-6.1-terra", "--", "inspect this"])
+        self.assertEqual(implementation, ["/bin/codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "--skip-git-repo-check", "--model", "gpt-6-luna", "--", "edit this"])
+
     def test_agy_receives_prompt_as_print_value(self):
         with mock.patch.object(bridge, "agent_binary", return_value="/bin/agy"):
             command = bridge.cli_command("agy", "--review this", "research")
-        self.assertEqual(command, ["/bin/agy", "--mode", "plan", "--print=--review this"])
+        self.assertEqual(command, ["/bin/agy", "--mode", "plan", "--model", "gemini-3.8-flash-high", "--print=--review this"])
 
     def test_claude_prompt_is_after_option_separator(self):
         with mock.patch.object(bridge, "agent_binary", return_value="/bin/claude"):
@@ -117,6 +128,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("agy", delegate["inputSchema"]["properties"]["agent"]["enum"])
         self.assertIn("profile", delegate["inputSchema"]["properties"])
         self.assertIn("native", delegate["inputSchema"]["properties"]["profile"]["enum"])
+
+    def test_codex_is_peer_but_excluded_when_it_is_the_host(self):
+        with mock.patch.object(bridge, "ORCHESTRATOR", "claude"):
+            claude_tools = bridge.tools_for_host()
+        delegate = next(item for item in claude_tools if item["name"] == "delegate_agent")
+        self.assertIn("codex", delegate["inputSchema"]["properties"]["agent"]["enum"])
+        with mock.patch.object(bridge, "ORCHESTRATOR", "codex"):
+            codex_tools = bridge.tools_for_host()
+        delegate = next(item for item in codex_tools if item["name"] == "delegate_agent")
+        self.assertNotIn("codex", delegate["inputSchema"]["properties"]["agent"]["enum"])
 
 
 if __name__ == "__main__":
