@@ -4,6 +4,14 @@ All notable changes to Agent Orchestrator. Versions are ordered newest first.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-27
+
+### Changed
+
+- Moved the hard agent call and peer-agent budget from chat `session_id` to `task_id`, so starting a new task in the same chat gets its own budget.
+- Added `max_task_calls` and `max_task_peers` configuration keys (alongside `max_session_calls` and `max_session_peers`).
+- Updated `usage_report`, tool descriptions, server `instructions`, and documentation to reflect per-task budgets.
+
 ## [0.4.4] - 2026-11-27
 
 ### Added

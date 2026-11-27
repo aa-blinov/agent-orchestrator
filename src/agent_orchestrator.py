@@ -102,9 +102,13 @@ def load_config(path=CONFIG_PATH):
         settings["agents"].update(user_settings.get("agents", {}))
         settings["profiles"].update(user_settings.get("profiles", {}))
         settings["default_profile"] = user_settings.get("default_profile", "native")
-        if "max_session_calls" in user_settings:
+        if "max_task_calls" in user_settings:
+            settings["max_session_calls"] = user_settings["max_task_calls"]
+        elif "max_session_calls" in user_settings:
             settings["max_session_calls"] = user_settings["max_session_calls"]
-        if "max_session_peers" in user_settings:
+        if "max_task_peers" in user_settings:
+            settings["max_session_peers"] = user_settings["max_task_peers"]
+        elif "max_session_peers" in user_settings:
             settings["max_session_peers"] = user_settings["max_session_peers"]
 
     for limit_key in ("max_session_calls", "max_session_peers"):
@@ -217,34 +221,34 @@ def open_db(path=None):
     return contextlib.closing(sqlite3.connect(path or USAGE_DB, timeout=10))
 
 
-def reserve_agent_calls(session_id, agents, path=None):
-    """Atomically reserves CLI-call slots, including parallel consultations."""
+def reserve_agent_calls(task_id, agents, path=None):
+    """Atomically reserves CLI-call slots per task_id, including parallel consultations."""
     path = path or USAGE_DB
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open_db(path) as database, database:
-        database.execute("""CREATE TABLE IF NOT EXISTS session_agent_budgets (
-            session_id TEXT PRIMARY KEY,
+        database.execute("""CREATE TABLE IF NOT EXISTS task_agent_budgets (
+            task_id TEXT PRIMARY KEY,
             calls_reserved INTEGER NOT NULL,
             agents_json TEXT NOT NULL
         )""")
         database.execute("BEGIN IMMEDIATE")
-        row = database.execute("SELECT calls_reserved, agents_json FROM session_agent_budgets WHERE session_id = ?",
-                               (session_id,)).fetchone()
+        row = database.execute("SELECT calls_reserved, agents_json FROM task_agent_budgets WHERE task_id = ?",
+                               (task_id,)).fetchone()
         if row:
             calls_reserved, agent_names = row[0], set(json.loads(row[1]))
         else:
             calls_reserved, agent_names = 0, set()
         requested_agents = set(agents)
         if calls_reserved + len(agents) > MAX_SESSION_AGENT_CALLS:
-            raise ValueError("chat session {!r} has used {}/{} agent calls; this request needs {} more. No agents were started.".format(
-                session_id, calls_reserved, MAX_SESSION_AGENT_CALLS, len(agents)))
+            raise ValueError("task {!r} has used {}/{} agent calls; this request needs {} more. No agents were started.".format(
+                task_id, calls_reserved, MAX_SESSION_AGENT_CALLS, len(agents)))
         combined_agents = agent_names | requested_agents
         if len(combined_agents) > MAX_SESSION_PEERS:
-            raise ValueError("chat session {!r} already involves {} distinct peer agents; the limit is {}. No agents were started.".format(
-                session_id, len(agent_names), MAX_SESSION_PEERS))
-        database.execute("""INSERT INTO session_agent_budgets(session_id, calls_reserved, agents_json) VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET calls_reserved=excluded.calls_reserved, agents_json=excluded.agents_json""",
-            (session_id, calls_reserved + len(agents), json.dumps(sorted(combined_agents))))
+            raise ValueError("task {!r} already involves {} distinct peer agents; the limit is {}. No agents were started.".format(
+                task_id, len(agent_names), MAX_SESSION_PEERS))
+        database.execute("""INSERT INTO task_agent_budgets(task_id, calls_reserved, agents_json) VALUES (?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET calls_reserved=excluded.calls_reserved, agents_json=excluded.agents_json""",
+            (task_id, calls_reserved + len(agents), json.dumps(sorted(combined_agents))))
         database.commit()
     os.chmod(path, 0o600)
 
@@ -331,14 +335,14 @@ def tools_for_host():
     if len(names) >= 2:
         tools.append(tool(
             "consult_agents",
-            "Используй экономно: обычно достаточно одного исполнителя, а ведущий сам проверяет изменения и проверки. Запускай двух или трёх агентов параллельно, только если независимые мнения могут изменить важное или неопределённое решение; это заменяет отдельный исследовательский вызов. Жёсткий лимит на чат общий с delegate_agent: {}. Создай один session_id для этого чата и повторяй его во всех вызовах; task_id отдельно группирует расходы по задаче. Превышение лимита отклоняется до запуска агентов. Не повторяй вызов без сбоя или конкретного замечания.".format(limit_phrase),
-            {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный идентификатор задачи для группировки расходов."}, "session_id": {"type": "string", "description": "Обязательный постоянный идентификатор этого чата. Повторяй его во всех вызовах. Общий лимит: {}.".format(limit_phrase)}},
+            "Используй экономно: обычно достаточно одного исполнителя, а ведущий сам проверяет изменения и проверки. Запускай двух или трёх агентов параллельно, только если независимые мнения могут изменить важное или неопределённое решение; это заменяет отдельный исследовательский вызов. Жёсткий лимит на одну задачу (task_id) общий с delegate_agent: {}. Повторяй один task_id в рамках одной задачи и создавай новый task_id для следующей задачи в чате; session_id используется для идентификации чата. Превышение лимита отклоняется до запуска агентов. Не повторяй вызов без сбоя или конкретного замечания.".format(limit_phrase),
+            {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный постоянный идентификатор одной задачи. Лимит на задачу: {}.".format(limit_phrase)}, "session_id": {"type": "string", "description": "Обязательный идентификатор чата."}},
             ["agents", "task", "cwd", "task_id", "session_id"]))
     if names:
         tools.append(tool(
             "delegate_agent",
-            "Передай одному установленному агенту ограниченную задачу. Обычно достаточно одного исполнителя: ведущий сам проверяет изменения и запускает проверки. Режим research используй для одного независимого мнения или проверки, если этого требует риск. Добавляй помощника только ради отдельного нерешённого вопроса; повторяй вызов лишь после сбоя или конкретного замечания. Жёсткий лимит на чат общий с consult_agents: {}. Повторяй один session_id во всех вызовах этого чата; task_id отдельно группирует расходы по задаче. Превышение лимита отклоняется до запуска. Режим implement создаёт отдельную ветку и рабочую копию Git, возвращает diff и не объединяет и не отправляет изменения.".format(limit_phrase),
-            {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный идентификатор задачи для группировки расходов."}, "session_id": {"type": "string", "description": "Обязательный постоянный идентификатор этого чата. Повторяй его во всех вызовах. Общий лимит: {}.".format(limit_phrase)}},
+            "Передай одному установленному агенту ограниченную задачу. Обычно достаточно одного исполнителя: ведущий сам проверяет изменения и запускает проверки. Режим research используй для одного независимого мнения или проверки, если этого требует риск. Добавляй помощника только ради отдельного нерешённого вопроса; повторяй вызов лишь после сбоя или конкретного замечания. Жёсткий лимит на одну задачу (task_id) общий с consult_agents: {}. Повторяй один task_id в рамках одной задачи и создавай новый task_id для следующей задачи в чате. Превышение лимита отклоняется до запуска. Режим implement создаёт отдельную ветку и рабочую копию Git, возвращает diff и не объединяет и не отправляет изменения.".format(limit_phrase),
+            {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный постоянный идентификатор одной задачи. Лимит на задачу: {}.".format(limit_phrase)}, "session_id": {"type": "string", "description": "Обязательный идентификатор чата."}},
             ["agent", "task", "cwd", "mode", "task_id", "session_id"]))
     return tools
 
@@ -605,19 +609,19 @@ def group_line(group):
     return "{} / {}: {} calls, {} with usage reported | {}".format(
         group["agent"], group["model"], group["calls"], group["reported"], counter_text(group))
 
-def session_budget_line(session_id, path=None):
-    """Shows consumed reservations for one caller-supplied chat identifier."""
+def session_budget_line(task_id, path=None):
+    """Shows consumed reservations for one task_id."""
     path = path or USAGE_DB
     if not os.path.isfile(path):
         calls_used, agent_count = 0, 0
     else:
         with open_db(path) as database:
-            exists = database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_agent_budgets'").fetchone()
-            row = database.execute("SELECT calls_reserved, agents_json FROM session_agent_budgets WHERE session_id = ?",
-                                   (session_id,)).fetchone() if exists else None
+            exists = database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_agent_budgets'").fetchone()
+            row = database.execute("SELECT calls_reserved, agents_json FROM task_agent_budgets WHERE task_id = ?",
+                                   (task_id,)).fetchone() if exists else None
         calls_used, agent_count = (row[0], len(json.loads(row[1]))) if row else (0, 0)
-    return "Chat session agent budget: {}/{} calls used; {}/{} distinct peer agents.".format(
-        calls_used, MAX_SESSION_AGENT_CALLS, agent_count, MAX_SESSION_PEERS)
+    return "Task agent budget ({}): {}/{} calls used; {}/{} distinct peer agents.".format(
+        task_id, calls_used, MAX_SESSION_AGENT_CALLS, agent_count, MAX_SESSION_PEERS)
 
 def usage_report(args):
     if not isinstance(args, dict):
@@ -628,21 +632,18 @@ def usage_report(args):
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
         raise ValueError("limit must be an integer from 1 to 100")
     if not os.path.isfile(USAGE_DB):
-        if session_id:
-            return session_budget_line(session_id)
+        if task_id:
+            return session_budget_line(task_id)
         return "No usage records yet. Records are stored locally at {}.".format(USAGE_DB)
     if session_id and not task_id:
-        return session_budget_line(session_id)
+        return "Budgets are tracked per task_id. Pass task_id to inspect a task's budget and usage."
     with open_db(USAGE_DB) as database:
         database.row_factory = sqlite3.Row
         if task_id:
             rows = database.execute("SELECT * FROM agent_calls WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
             if not rows:
-                suffix = " " + session_budget_line(session_id) if session_id else ""
-                return "No usage records found for task_id {}.{}".format(task_id, suffix)
-            report = ["Usage for task_id {} ({} calls).".format(task_id, len(rows))]
-            if session_id:
-                report.append(session_budget_line(session_id))
+                return "No usage records found for task_id {}. {}".format(task_id, session_budget_line(task_id))
+            report = ["Usage for task_id {} ({} calls).".format(task_id, len(rows)), session_budget_line(task_id)]
             for row in rows:
                 usage = {key: row[key] for key in USAGE_FIELDS if row[key] is not None}
                 report.append("- {} | {} | {} / {} | exit {}{} | {:.1f}s | {}".format(
@@ -827,7 +828,7 @@ def consult(args, request_id=None, cancel_event=None):
         raise ValueError("agents must contain two or three distinct names")
     if len(set(agents)) != len(agents) or any(a not in available_agents() for a in agents):
         raise ValueError("agents must be distinct installed peer agents")
-    reserve_agent_calls(session_id, agents)
+    reserve_agent_calls(task_id, agents)
     prompt = task + "\n\nRead-only consultation: do not edit files or run commands that change project state. Give reasoning, risks, and a recommended approach."
     outputs = {}
     statuses = {}
@@ -865,7 +866,7 @@ def implement(agent, task, path, profile=None, task_id=None, session_id=None,
     worktree = os.path.join(HOME, ".agent-orchestrator", "worktrees", os.path.basename(root) + "-" + stamp + "-" + unique)
     os.makedirs(os.path.dirname(worktree), exist_ok=True)
     augmented = task + "\n\nWork in this worktree only. Do not push, merge, or alter other worktrees. Do not commit; leave changes for the orchestrator to review. Summarize implementation and checks."
-    reserve_agent_calls(session_id, [agent])
+    reserve_agent_calls(task_id, [agent])
     try:
         git(root, "worktree", "add", "-b", branch, worktree, base)
         agent_cwd = worktree if relative_path == "." else os.path.join(worktree, relative_path)
@@ -923,7 +924,7 @@ def call_tool(name, args, request_id=None, cancel_event=None):
         return text_result(report, not okay)
     task_id = required_task_id(args)
     session_id = required_session_id(args)
-    reserve_agent_calls(session_id, [agent])
+    reserve_agent_calls(task_id, [agent])
     code, output, timed_out, usage, saved = execute(
         agent, task, mode, path, CONSULT_TIMEOUT, profile, task_id, request_id, cancel_event)
     return text_result("Task ID: {} (usage record {})\nAgent: {}\nExit code: {}{}\n{}".format(task_id, "saved" if saved else "not saved", agent, code, " (timed out)" if timed_out else "", output), code != 0 or timed_out)
@@ -965,8 +966,8 @@ def handle(request, executor=None):
         rpc_error(msg_id, -32602, "params must be an object")
     elif method == "initialize":
         result(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-orchestrator", "version": "0.4.4"},
-                        "instructions": "Для каждого чата создай один session_id и повторяй его во всех вызовах delegate_agent и consult_agents. Лимит действует на чат: {}. Обычно достаточно одного исполнителя; ведущий сам проверяет diff и проверки. Подключай других только при конкретном риске или нерешённом вопросе. task_id отдельно группирует вызовы по задаче.".format(session_limit_phrase())})
+                        "serverInfo": {"name": "agent-orchestrator", "version": "0.4.5"},
+                        "instructions": "Для каждой задачи создавай свой task_id и повторяй его во всех вызовах delegate_agent и consult_agents в рамках этой задачи; session_id используется для идентификации чата. Лимит действует на одну задачу (task_id): {}. Обычно достаточно одного исполнителя; ведущий сам проверяет diff и проверки. Подключай других только при конкретном риске или нерешённом вопросе.".format(session_limit_phrase())})
     elif method == "ping":
         result(msg_id, {})
     elif method == "tools/list":
