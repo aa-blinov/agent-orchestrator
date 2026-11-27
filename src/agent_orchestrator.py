@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Локальный stdio-мост MCP для контролируемой передачи задач кодовым CLI."""
+from collections import deque
 import concurrent.futures
+import contextlib
 import copy
 import json
 import os
@@ -17,11 +19,15 @@ import uuid
 HOME = os.path.realpath(os.path.expanduser("~"))
 MAX_TASK = 20000
 MAX_OUTPUT = 18000
+MAX_RAW_OUTPUT = 2 * 1024 * 1024
 DELEGATE_TIMEOUT = 7200
 CONSULT_TIMEOUT = 7200
+SHUTDOWN_GRACE_SECONDS = 5.0
 MAX_CONSULTANTS = 3
-MAX_SESSION_AGENT_CALLS = 4
-MAX_SESSION_PEERS = 3
+DEFAULT_MAX_SESSION_CALLS = 4
+DEFAULT_MAX_SESSION_PEERS = 3
+MAX_SESSION_AGENT_CALLS = DEFAULT_MAX_SESSION_CALLS
+MAX_SESSION_PEERS = DEFAULT_MAX_SESSION_PEERS
 ACTIVE_CHILD_GROUPS = set()
 ACTIVE_CHILDREN_BY_REQUEST = {}
 MCP_REQUESTS = {}
@@ -75,9 +81,15 @@ CONFIG_PATH = os.path.join(CONFIG_ROOT, "agent-orchestrator", "config.json")
 DATA_ROOT = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
 USAGE_DB = os.path.join(DATA_ROOT, "agent-orchestrator", "usage.sqlite3")
 
-def load_settings(path=CONFIG_PATH):
+def load_config(path=CONFIG_PATH):
     """Загружает настройки пользователей, не требуя их для штатного запуска."""
-    settings = {"agents": {}, "profiles": {"native": {"description": "Use each CLI's configured default model", "models": {}}}, "default_profile": "native"}
+    settings = {
+        "agents": {},
+        "profiles": {"native": {"description": "Use each CLI's configured default model", "models": {}}},
+        "default_profile": "native",
+        "max_session_calls": DEFAULT_MAX_SESSION_CALLS,
+        "max_session_peers": DEFAULT_MAX_SESSION_PEERS,
+    }
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as source:
             user_settings = json.load(source)
@@ -90,6 +102,15 @@ def load_settings(path=CONFIG_PATH):
         settings["agents"].update(user_settings.get("agents", {}))
         settings["profiles"].update(user_settings.get("profiles", {}))
         settings["default_profile"] = user_settings.get("default_profile", "native")
+        if "max_session_calls" in user_settings:
+            settings["max_session_calls"] = user_settings["max_session_calls"]
+        if "max_session_peers" in user_settings:
+            settings["max_session_peers"] = user_settings["max_session_peers"]
+
+    for limit_key in ("max_session_calls", "max_session_peers"):
+        limit_val = settings[limit_key]
+        if not isinstance(limit_val, int) or isinstance(limit_val, bool) or limit_val < 1:
+            raise ValueError("config {!r} must be a positive integer".format(limit_key))
 
     agents = copy.deepcopy(DEFAULT_AGENTS)
     for name, override in settings["agents"].items():
@@ -135,6 +156,8 @@ def load_settings(path=CONFIG_PATH):
             raise ValueError("agent {!r} needs model_args to use preferred models".format(name))
         if not isinstance(spec["label"], str):
             raise ValueError("agent {!r} label must be a string".format(name))
+        if "parser" in spec and spec["parser"] not in ("codex", "claude", "agy", "opencode", "plain"):
+            raise ValueError("agent {!r} parser must be one of codex, claude, agy, opencode, plain".format(name))
         agents[name] = spec
 
     profiles = settings["profiles"]
@@ -153,9 +176,15 @@ def load_settings(path=CONFIG_PATH):
                 raise ValueError("agent {!r} needs model_args to use a profile model".format(agent))
     if settings["default_profile"] not in profiles:
         raise ValueError("default_profile must name a profile in config")
-    return agents, profiles, settings["default_profile"]
+    return agents, profiles, settings["default_profile"], settings["max_session_calls"], settings["max_session_peers"]
 
-AGENTS, PROFILES, DEFAULT_PROFILE = load_settings()
+
+def load_settings(path=CONFIG_PATH):
+    """Возвращает каталог агентов, профили и профиль по умолчанию."""
+    return load_config(path)[:3]
+
+
+AGENTS, PROFILES, DEFAULT_PROFILE, MAX_SESSION_AGENT_CALLS, MAX_SESSION_PEERS = load_config()
 
 # The host that loaded this MCP server is the orchestrator. Excluding it avoids
 # recursive calls while leaving every other installed CLI available.
@@ -183,11 +212,16 @@ def required_session_id(args):
         raise ValueError("session_id is required; create one identifier for this chat and reuse it for all agent calls")
     return resolve_task_id(args["session_id"])
 
+def open_db(path=None):
+    """Открывает SQLite-соединение с гарантированным закрытием после выхода из контекста."""
+    return contextlib.closing(sqlite3.connect(path or USAGE_DB, timeout=10))
+
+
 def reserve_agent_calls(session_id, agents, path=None):
     """Atomically reserves CLI-call slots, including parallel consultations."""
     path = path or USAGE_DB
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with sqlite3.connect(path, timeout=10) as database:
+    with open_db(path) as database, database:
         database.execute("""CREATE TABLE IF NOT EXISTS session_agent_budgets (
             session_id TEXT PRIMARY KEY,
             calls_reserved INTEGER NOT NULL,
@@ -219,7 +253,7 @@ def store_usage(task_id, agent, model, mode, exit_code, timed_out, duration, usa
     path = path or USAGE_DB
     os.makedirs(os.path.dirname(path), exist_ok=True)
     values = usage or {}
-    with sqlite3.connect(path, timeout=10) as database:
+    with open_db(path) as database, database:
         database.execute("""CREATE TABLE IF NOT EXISTS agent_calls (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id TEXT NOT NULL,
@@ -276,10 +310,17 @@ def profile_schema():
 def tool(name, description, properties, required):
     return {"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": required}}
 
+def session_limit_phrase():
+    if (MAX_SESSION_AGENT_CALLS, MAX_SESSION_PEERS) == (DEFAULT_MAX_SESSION_CALLS, DEFAULT_MAX_SESSION_PEERS):
+        return "четыре запуска агента и не более трёх разных помощников"
+    return "{} запусков агента и не более {} разных помощников".format(MAX_SESSION_AGENT_CALLS, MAX_SESSION_PEERS)
+
+
 def tools_for_host():
     agents = available_agents()
     names = list(agents)
     profile = profile_schema()
+    limit_phrase = session_limit_phrase()
     tools = [
         tool("agent_catalog", "Show available coding agents, preferred models, and model profiles.", {}, []),
         tool("usage_report", "Read locally stored token usage by task and agent. Pass task_id to group usage for one task, or session_id to inspect the per-chat agent-call budget.",
@@ -290,14 +331,14 @@ def tools_for_host():
     if len(names) >= 2:
         tools.append(tool(
             "consult_agents",
-            "Используй экономно: обычно достаточно одного исполнителя, а ведущий сам проверяет изменения и проверки. Запускай двух или трёх агентов параллельно, только если независимые мнения могут изменить важное или неопределённое решение; это заменяет отдельный исследовательский вызов. Жёсткий лимит на чат общий с delegate_agent: четыре запуска агента и не более трёх разных помощников. Создай один session_id для этого чата и повторяй его во всех вызовах; task_id отдельно группирует расходы по задаче. Превышение лимита отклоняется до запуска агентов. Не повторяй вызов без сбоя или конкретного замечания.",
-            {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный идентификатор задачи для группировки расходов."}, "session_id": {"type": "string", "description": "Обязательный постоянный идентификатор этого чата. Повторяй его во всех вызовах. Общий лимит: четыре запуска и три разных помощника."}},
+            "Используй экономно: обычно достаточно одного исполнителя, а ведущий сам проверяет изменения и проверки. Запускай двух или трёх агентов параллельно, только если независимые мнения могут изменить важное или неопределённое решение; это заменяет отдельный исследовательский вызов. Жёсткий лимит на чат общий с delegate_agent: {}. Создай один session_id для этого чата и повторяй его во всех вызовах; task_id отдельно группирует расходы по задаче. Превышение лимита отклоняется до запуска агентов. Не повторяй вызов без сбоя или конкретного замечания.".format(limit_phrase),
+            {"agents": {"type": "array", "items": {"type": "string", "enum": names}, "minItems": 2, "maxItems": min(MAX_CONSULTANTS, len(names))}, "task": {"type": "string"}, "cwd": {"type": "string"}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный идентификатор задачи для группировки расходов."}, "session_id": {"type": "string", "description": "Обязательный постоянный идентификатор этого чата. Повторяй его во всех вызовах. Общий лимит: {}.".format(limit_phrase)}},
             ["agents", "task", "cwd", "task_id", "session_id"]))
     if names:
         tools.append(tool(
             "delegate_agent",
-            "Передай одному установленному агенту ограниченную задачу. Обычно достаточно одного исполнителя: ведущий сам проверяет изменения и запускает проверки. Режим research используй для одного независимого мнения или проверки, если этого требует риск. Добавляй помощника только ради отдельного нерешённого вопроса; повторяй вызов лишь после сбоя или конкретного замечания. Жёсткий лимит на чат общий с consult_agents: четыре запуска и не более трёх разных помощников. Повторяй один session_id во всех вызовах этого чата; task_id отдельно группирует расходы по задаче. Превышение лимита отклоняется до запуска. Режим implement создаёт отдельную ветку и рабочую копию Git, возвращает diff и не объединяет и не отправляет изменения.",
-            {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный идентификатор задачи для группировки расходов."}, "session_id": {"type": "string", "description": "Обязательный постоянный идентификатор этого чата. Повторяй его во всех вызовах. Общий лимит: четыре запуска и три разных помощника."}},
+            "Передай одному установленному агенту ограниченную задачу. Обычно достаточно одного исполнителя: ведущий сам проверяет изменения и запускает проверки. Режим research используй для одного независимого мнения или проверки, если этого требует риск. Добавляй помощника только ради отдельного нерешённого вопроса; повторяй вызов лишь после сбоя или конкретного замечания. Жёсткий лимит на чат общий с consult_agents: {}. Повторяй один session_id во всех вызовах этого чата; task_id отдельно группирует расходы по задаче. Превышение лимита отклоняется до запуска. Режим implement создаёт отдельную ветку и рабочую копию Git, возвращает diff и не объединяет и не отправляет изменения.".format(limit_phrase),
+            {"agent": {"type": "string", "enum": names}, "task": {"type": "string"}, "cwd": {"type": "string"}, "mode": {"type": "string", "enum": ["research", "implement"]}, "profile": profile, "task_id": {"type": "string", "description": "Обязательный идентификатор задачи для группировки расходов."}, "session_id": {"type": "string", "description": "Обязательный постоянный идентификатор этого чата. Повторяй его во всех вызовах. Общий лимит: {}.".format(limit_phrase)}},
             ["agent", "task", "cwd", "mode", "task_id", "session_id"]))
     return tools
 
@@ -405,12 +446,17 @@ def normalized_usage(value):
                 normalized[target] = int(candidate)
     return normalized or None
 
+def agent_parser(agent):
+    return AGENTS.get(agent, {}).get("parser", agent)
+
+
 def extract_usage(agent, output):
     """Возвращает человекочитаемый ответ и только те счётчики, что сообщил CLI."""
+    parser = agent_parser(agent)
     events = json_events(output)
     usage = None
     texts = []
-    if agent == "codex":
+    if parser == "codex":
         for event in events:
             if event.get("type") == "turn.completed":
                 usage = normalized_usage(event.get("usage")) or usage
@@ -418,13 +464,13 @@ def extract_usage(agent, output):
             if event.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
                 if isinstance(item.get("text"), str):
                     texts.append(item["text"])
-    elif agent in ("claude", "agy"):
+    elif parser in ("claude", "agy"):
         for event in events:
             usage = normalized_usage(event.get("usage")) or usage
-            text = event.get("result") if agent == "claude" else event.get("response")
+            text = event.get("result") if parser == "claude" else event.get("response")
             if isinstance(text, str):
                 texts.append(text)
-    elif agent == "opencode":
+    elif parser == "opencode":
         step_usages = []
         for event in events:
             part = event.get("part", {})
@@ -441,19 +487,21 @@ def extract_usage(agent, output):
             for step in step_usages:
                 for key, count in step.items():
                     usage[key] = usage.get(key, 0) + count
-    if usage is None:
+    if parser == "codex" and usage is None:
         # Codex may expose a total in its human-readable footer on older versions.
         match = re.search(r"tokens used\s+([0-9][0-9 ,]*)", output, re.IGNORECASE)
         if match:
             usage = {"total_tokens": int(re.sub(r"[^0-9]", "", match.group(1)))}
     if texts:
-        output = "\n".join(text.strip() for text in texts if text.strip())
+        prefix = "...[earlier output truncated]\n" if output.startswith("...[earlier output truncated]\n") else ""
+        output = prefix + "\n".join(text.strip() for text in texts if text.strip())
     return output, usage
 
 def agent_exit_status(agent, return_code, output):
     """Trust structured CLI failure status even when the CLI exits zero."""
+    parser = agent_parser(agent)
     events = json_events(output)
-    if agent == "agy":
+    if parser == "agy":
         for event in reversed(events):
             if "status" not in event and "error" not in event and "finished_reason" not in event:
                 continue
@@ -464,7 +512,7 @@ def agent_exit_status(agent, return_code, output):
                     "error", "print_timeout", "interrupted"):
                 return return_code if return_code else 1
             break
-    if agent == "codex" and any(event.get("type") == "turn.failed" for event in events):
+    if parser == "codex" and any(event.get("type") == "turn.failed" for event in events):
         return return_code if return_code else 1
     return return_code
 
@@ -563,7 +611,7 @@ def session_budget_line(session_id, path=None):
     if not os.path.isfile(path):
         calls_used, agent_count = 0, 0
     else:
-        with sqlite3.connect(path, timeout=10) as database:
+        with open_db(path) as database:
             exists = database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_agent_budgets'").fetchone()
             row = database.execute("SELECT calls_reserved, agents_json FROM session_agent_budgets WHERE session_id = ?",
                                    (session_id,)).fetchone() if exists else None
@@ -585,7 +633,7 @@ def usage_report(args):
         return "No usage records yet. Records are stored locally at {}.".format(USAGE_DB)
     if session_id and not task_id:
         return session_budget_line(session_id)
-    with sqlite3.connect(USAGE_DB, timeout=10) as database:
+    with open_db(USAGE_DB) as database:
         database.row_factory = sqlite3.Row
         if task_id:
             rows = database.execute("SELECT * FROM agent_calls WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
@@ -624,6 +672,68 @@ def usage_report(args):
     report.append("Pass a task_id to inspect its individual calls. Records are stored locally at {}.".format(USAGE_DB))
     return "\n".join(report)
 
+def read_bounded_stream(stream, max_bytes=MAX_RAW_OUTPUT):
+    """Читает поток в кольцевой буфер, не позволяя бесконечному выводу исчерпать память."""
+    chunks = deque()
+    total = 0
+    truncated = False
+    lock = threading.Lock()
+
+    def collect():
+        nonlocal total, truncated
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                with lock:
+                    if len(chunk) >= max_bytes:
+                        if total > 0 or len(chunk) > max_bytes:
+                            truncated = True
+                        chunks.clear()
+                        chunks.append(chunk[-max_bytes:])
+                        total = max_bytes
+                        continue
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    excess = total - max_bytes
+                    if excess > 0:
+                        truncated = True
+                        while excess > 0 and chunks:
+                            head = chunks[0]
+                            if len(head) <= excess:
+                                chunks.popleft()
+                                total -= len(head)
+                                excess -= len(head)
+                            else:
+                                chunks[0] = head[excess:]
+                                total -= excess
+                                excess = 0
+        except OSError:
+            pass
+
+    def text():
+        with lock:
+            body = b"".join(chunks).decode("utf-8", errors="replace")
+            was_truncated = truncated
+        if was_truncated:
+            return "...[earlier output truncated]\n" + body
+        return body
+
+    return collect, text
+
+
+def drain_reader(reader, pid):
+    """Дожидается закрытия stdout и принудительно останавливает потомков, удерживающих канал."""
+    reader.join(timeout=1)
+    if reader.is_alive():
+        signal_child_group(pid, signal.SIGTERM)
+        reader.join(timeout=1)
+        if reader.is_alive():
+            signal_child_group(pid, signal.SIGKILL)
+            reader.join(timeout=0.5)
+
+
 def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None,
             request_id=None, cancel_event=None):
     """Запускает группу процессов и не отдаёт дочернему процессу stdin MCP."""
@@ -637,7 +747,11 @@ def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None,
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         start_new_session=True)
     register_child(request_id, process.pid)
-    if cancel_event is not None and cancel_event.is_set():
+    collect, read_text = read_bounded_stream(process.stdout)
+    reader = threading.Thread(target=collect, daemon=True)
+    reader.start()
+    cancelled_at_launch = cancel_event is not None and cancel_event.is_set()
+    if cancelled_at_launch:
         signal_child_group(process.pid, signal.SIGTERM)
     def finish(code, output, timed_out):
         output, usage = extract_usage(agent, output)
@@ -651,28 +765,38 @@ def execute(agent, task, mode, cwd, timeout, profile=None, task_id=None,
             sys.stderr.flush()
         return code, output[-MAX_OUTPUT:], timed_out, usage, saved
     try:
-        raw, _ = process.communicate(timeout=timeout)
-        output = raw.decode("utf-8", errors="replace")
+        if cancelled_at_launch:
+            try:
+                process.wait(timeout=min(timeout, SHUTDOWN_GRACE_SECONDS))
+            except subprocess.TimeoutExpired:
+                signal_child_group(process.pid, signal.SIGKILL)
+                process.wait()
+        else:
+            process.wait(timeout=timeout)
+        drain_reader(reader, process.pid)
+        output = read_text()
         code = agent_exit_status(agent, process.returncode, output)
         if cancel_event is not None and cancel_event.is_set():
             code = 130
             output += "\nAgent call cancelled by the MCP client."
         return finish(code, output, False)
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.communicate(timeout=5)
+            signal_child_group(process.pid, signal.SIGTERM)
+            process.wait(timeout=5)
         except Exception:
+            signal_child_group(process.pid, signal.SIGKILL)
+            process.wait()
+        drain_reader(reader, process.pid)
+        return finish(124, read_text() + "\nTimed out after {} seconds; process group was stopped.".format(timeout), True)
+    finally:
+        # Closing a BufferedReader while a daemon reader is blocked in read()
+        # deadlocks on Python's internal I/O lock if a grandchild kept stdout open.
+        if process.stdout is not None and not reader.is_alive():
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                process.stdout.close()
             except OSError:
                 pass
-            process.communicate()
-        partial = exc.output or b""
-        if not isinstance(partial, str):
-            partial = partial.decode("utf-8", errors="replace")
-        return finish(124, partial + "\nTimed out after {} seconds; process group was stopped.".format(timeout), True)
-    finally:
         unregister_child(request_id, process.pid)
 
 def git(path, *args):
@@ -780,6 +904,8 @@ def call_tool(name, args, request_id=None, cancel_event=None):
         return "Current orchestrator: {}. Available peer agents:\n{}\n\nModel profiles (default: {}):\n{}\n\nEach agent can use a separate preferred model for research/complex reasoning and implementation. A selected profile overrides those role preferences; when no model is configured, the CLI's own default is used. Implementation runs in a Git worktree, not an operating-system sandbox; the selected CLI retains the user's permissions.".format(ORCHESTRATOR, "\n".join(agent_lines) or "(none)", DEFAULT_PROFILE, "\n".join(profile_lines))
     if name == "usage_report":
         return usage_report(args)
+    if cancel_event is not None and cancel_event.is_set():
+        return text_result("Cancelled before agent launch.", True)
     task, path = validate_args(args)
     if name == "consult_agents":
         return consult(args, request_id, cancel_event)
@@ -839,15 +965,15 @@ def handle(request, executor=None):
         rpc_error(msg_id, -32602, "params must be an object")
     elif method == "initialize":
         result(msg_id, {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agent-orchestrator", "version": "0.4.3"},
-                        "instructions": "Для каждого чата создай один session_id и повторяй его во всех вызовах delegate_agent и consult_agents. Лимит действует на чат: не более четырёх запусков агентов и трёх разных помощников. Обычно достаточно одного исполнителя; ведущий сам проверяет diff и проверки. Подключай других только при конкретном риске или нерешённом вопросе. task_id отдельно группирует вызовы по задаче."})
+                        "serverInfo": {"name": "agent-orchestrator", "version": "0.4.4"},
+                        "instructions": "Для каждого чата создай один session_id и повторяй его во всех вызовах delegate_agent и consult_agents. Лимит действует на чат: {}. Обычно достаточно одного исполнителя; ведущий сам проверяет diff и проверки. Подключай других только при конкретном риске или нерешённом вопросе. task_id отдельно группирует вызовы по задаче.".format(session_limit_phrase())})
     elif method == "ping":
         result(msg_id, {})
     elif method == "tools/list":
         result(msg_id, {"tools": tools_for_host()})
     elif method == "tools/call":
         name = params.get("name")
-        if not isinstance(name, str) or name not in {t["name"] for t in TOOLS}:
+        if not isinstance(name, str) or name not in {t["name"] for t in tools_for_host()}:
             rpc_error(msg_id, -32602, "Unknown tool: {}".format(name))
             return
         if msg_id is None or isinstance(msg_id, (dict, list, bool)):
@@ -866,38 +992,54 @@ def handle(request, executor=None):
     else:
         rpc_error(msg_id, -32601, "Method not found")
 
+def stop_active_children(grace_seconds=SHUTDOWN_GRACE_SECONDS):
+    """Останавливает активные группы дочерних процессов с эскалацией до SIGKILL."""
+    with MCP_STATE_LOCK:
+        for event in MCP_REQUESTS.values():
+            event.set()
+        signalled = set()
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        with MCP_STATE_LOCK:
+            current = set(ACTIVE_CHILD_GROUPS)
+        if not current:
+            return
+        for pid in current - signalled:
+            signal_child_group(pid, signal.SIGTERM)
+            signalled.add(pid)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    with MCP_STATE_LOCK:
+        remaining = list(ACTIVE_CHILD_GROUPS)
+    for pid in remaining:
+        signal_child_group(pid, signal.SIGKILL)
+
+
 def main():
     def stop_children(signum, frame):
-        with MCP_STATE_LOCK:
-            pids = list(ACTIVE_CHILD_GROUPS)
-        for pid in pids:
-            signal_child_group(pid, signal.SIGTERM)
-            escalation = threading.Timer(5, escalate_child_group, args=(pid,))
-            escalation.daemon = True
-            escalation.start()
+        # Ignore repeated signals so the finally block can finish SIGKILL escalation.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, stop_children)
     signal.signal(signal.SIGINT, stop_children)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        for line in sys.stdin:
-            try:
-                request = json.loads(line)
-            except ValueError as exc:
-                rpc_error(None, -32700, "Parse error", str(exc))
-                continue
-            try:
-                handle(request, executor)
-            except Exception as exc:
-                request_id = request.get("id") if isinstance(request, dict) else None
-                if request_id is not None:
-                    result(request_id, text_result("{}: {}".format(type(exc).__name__, exc), True))
-        with MCP_STATE_LOCK:
-            pending = list(MCP_REQUESTS.values())
-            pids = list(ACTIVE_CHILD_GROUPS)
-            for event in pending:
-                event.set()
-        for pid in pids:
-            signal_child_group(pid, signal.SIGTERM)
+        try:
+            for line in sys.stdin:
+                try:
+                    request = json.loads(line)
+                except ValueError as exc:
+                    rpc_error(None, -32700, "Parse error", str(exc))
+                    continue
+                try:
+                    handle(request, executor)
+                except Exception as exc:
+                    request_id = request.get("id") if isinstance(request, dict) else None
+                    if request_id is not None:
+                        result(request_id, text_result("{}: {}".format(type(exc).__name__, exc), True))
+        finally:
+            stop_active_children()
 
 if __name__ == "__main__":
     main()

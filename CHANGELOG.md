@@ -4,6 +4,20 @@ All notable changes to Agent Orchestrator. Versions are ordered newest first.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-27
+
+### Added
+
+- Added configurable `max_session_calls` and `max_session_peers` in `config.json` (defaulting to 4 and 3).
+- Added optional `parser` setting for custom CLI agents to reuse structured output and token-usage parsing.
+
+### Fixed
+
+- Close SQLite connections cleanly via `contextlib.closing` to avoid `ResourceWarning`s.
+- Escalate `SIGTERM` to `SIGKILL` for active child process groups on server shutdown, including grandchildren holding `stdout` open.
+- Bound CLI `stdout`/`stderr` collection in memory with a 2 MiB ring buffer while preserving the truncation marker.
+- Validate `tools/call` against `tools_for_host()` dynamically.
+
 ## [0.4.3] - 2026-11-12
 
 ### Fixed

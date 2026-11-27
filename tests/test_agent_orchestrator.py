@@ -138,6 +138,12 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(usage["reasoning_tokens"], 3)
         self.assertIn("not reported", bridge.usage_summary(None))
 
+    def test_extract_usage_preserves_truncation_marker(self):
+        raw = "...[earlier output truncated]\n" + '{"result":"Done","usage":{"input_tokens":4,"output_tokens":2}}'
+        answer, usage = bridge.extract_usage("claude", raw)
+        self.assertEqual(answer, "...[earlier output truncated]\nDone")
+        self.assertEqual(usage, {"input_tokens": 4, "output_tokens": 2})
+
     def test_usage_ledger_groups_calls_without_storing_prompts(self):
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "usage.sqlite3")
@@ -158,10 +164,30 @@ class UsageTests(unittest.TestCase):
             self.assertNotIn("subset", detail)
             self.assertIn("task-demo", recent)
             self.assertIn("  - codex / gpt-6-luna", recent)
-            with sqlite3.connect(path) as database:
+            with contextlib.closing(sqlite3.connect(path)) as database:
                 columns = {row[1] for row in database.execute("PRAGMA table_info(agent_calls)")}
             self.assertNotIn("prompt", columns)
             self.assertNotIn("response", columns)
+
+    def test_custom_agent_parser_reuses_structured_extraction(self):
+        config = {
+            "agents": {
+                "my-claude": {
+                    "command": "my-claude", "label": "My Claude", "parser": "claude",
+                    "args": {"research": ["--plan"], "implement": ["--edit"]},
+                    "task_args": {"research": ["{task}"], "implement": ["{task}"]},
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            with open(path, "w", encoding="utf-8") as output:
+                json.dump(config, output)
+            agents, _, _ = bridge.load_settings(path)
+        with mock.patch.object(bridge, "AGENTS", agents):
+            answer, usage = bridge.extract_usage("my-claude", '{"result":"OK","usage":{"input_tokens":5,"output_tokens":2}}')
+        self.assertEqual(answer, "OK")
+        self.assertEqual(usage, {"input_tokens": 5, "output_tokens": 2})
 
 
 class UsageGroupingTests(unittest.TestCase):
@@ -231,7 +257,7 @@ class BudgetTests(unittest.TestCase):
             bridge.reserve_agent_calls("task-budget", ["agy"], path)
             with self.assertRaisesRegex(ValueError, "used 4/4"):
                 bridge.reserve_agent_calls("task-budget", ["claude"], path)
-            with sqlite3.connect(path) as database:
+            with contextlib.closing(sqlite3.connect(path)) as database:
                 row = database.execute("SELECT calls_reserved FROM session_agent_budgets WHERE session_id = ?",
                                        ("task-budget",)).fetchone()
         self.assertEqual(row[0], 4)
@@ -277,6 +303,19 @@ class BudgetTests(unittest.TestCase):
             bridge.required_session_id({})
         self.assertEqual(bridge.required_session_id({"session_id": "chat-ok"}), "chat-ok")
 
+    def test_session_limits_can_be_configured_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            with open(path, "w", encoding="utf-8") as output:
+                json.dump({"max_session_calls": 8, "max_session_peers": 4}, output)
+            _, _, _, max_calls, max_peers = bridge.load_config(path)
+            self.assertEqual((max_calls, max_peers), (8, 4))
+
+            with open(path, "w", encoding="utf-8") as output:
+                json.dump({"max_session_calls": 0}, output)
+            with self.assertRaisesRegex(ValueError, "positive integer"):
+                bridge.load_config(path)
+
 
 class ProtocolTests(unittest.TestCase):
     def call(self, request):
@@ -288,7 +327,7 @@ class ProtocolTests(unittest.TestCase):
     def test_initialize_advertises_server(self):
         response = self.call({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})[0]
         self.assertEqual(response["result"]["serverInfo"]["name"], "agent-orchestrator")
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.3")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.4")
         self.assertIn("session_id", response["result"]["instructions"])
 
     def test_invalid_tool_name_returns_json_rpc_error(self):
@@ -387,6 +426,59 @@ class ProcessCancellationTests(unittest.TestCase):
             self.assertEqual(result_box[0][0], 130)
             with bridge.MCP_STATE_LOCK:
                 bridge.MCP_REQUESTS.pop(request_id, None)
+
+
+    def test_bounded_stream_keeps_tail_within_limit(self):
+        stream = io.BytesIO(b"A" * 200 + b"TAIL")
+        collect, read_text = bridge.read_bounded_stream(stream, max_bytes=32)
+        collect()
+        text = read_text()
+        self.assertTrue(text.startswith("...[earlier output truncated]\n"))
+        self.assertTrue(text.endswith("TAIL"))
+        body = text.split("\n", 1)[1]
+        self.assertEqual(len(body.encode("utf-8")), 32)
+
+    def test_bounded_stream_marks_truncation_across_multiple_and_exact_chunks(self):
+        class ChunkStream:
+            def __init__(self, chunks):
+                self._chunks = iter(chunks)
+            def read(self, _size):
+                return next(self._chunks, b"")
+
+        collect, read_text = bridge.read_bounded_stream(ChunkStream([b"HEAD", b"X" * 8]), max_bytes=8)
+        collect()
+        self.assertEqual(read_text(), "...[earlier output truncated]\n" + "X" * 8)
+
+        collect2, read_text2 = bridge.read_bounded_stream(ChunkStream([b"12345", b"67890", b"AB"]), max_bytes=8)
+        collect2()
+        self.assertEqual(read_text2(), "...[earlier output truncated]\n567890AB")
+
+    def test_stop_active_children_escalates_to_sigkill(self):
+        request_id = "shutdown-escalation-test"
+        cancel_event = threading.Event()
+        with bridge.MCP_STATE_LOCK:
+            bridge.MCP_REQUESTS[request_id] = cancel_event
+            bridge.ACTIVE_CHILD_GROUPS.add(999999)
+        try:
+            with mock.patch.object(bridge, "signal_child_group") as kill_mock:
+                bridge.stop_active_children(grace_seconds=0.05)
+            signals = [call.args[1] for call in kill_mock.call_args_list]
+            self.assertEqual(signals, [bridge.signal.SIGTERM, bridge.signal.SIGKILL])
+            self.assertTrue(cancel_event.is_set())
+        finally:
+            with bridge.MCP_STATE_LOCK:
+                bridge.ACTIVE_CHILD_GROUPS.discard(999999)
+                bridge.MCP_REQUESTS.pop(request_id, None)
+
+    def test_drain_reader_signals_stuck_grandchild_group(self):
+        fake_reader = mock.Mock()
+        fake_reader.is_alive.side_effect = [True, True]
+        with mock.patch.object(bridge, "signal_child_group") as kill_mock:
+            bridge.drain_reader(fake_reader, 12345)
+        self.assertEqual(
+            [call.args for call in kill_mock.call_args_list],
+            [(12345, bridge.signal.SIGTERM), (12345, bridge.signal.SIGKILL)],
+        )
 
 
 if __name__ == "__main__":

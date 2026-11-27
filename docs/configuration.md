@@ -36,7 +36,7 @@ The bridge requests structured output from each CLI and stores the input, output
 
 The bridge includes a `native` profile when no configuration file exists. If the file exists, its `default_profile` must name one of the configured profiles. An omitted `profile` uses this default.
 
-Each `delegate_agent` and `consult_agents` call requires a `task_id` and a `session_id`. Reuse one `session_id` for every agent call in a chat, including calls for different tasks in that chat; use a new one in a new chat. The bridge atomically allows at most four launched agent calls and three distinct peer agents per `session_id`. A consultation with two agents uses two call slots. The server cannot read a host chat identifier from standard MCP tool arguments, so the orchestrating agent creates the session ID once and carries it forward. `usage_report` accepts `session_id` to inspect the budget. This is a hard limit per supplied identifier; it cannot authenticate that an identifier corresponds to a particular chat.
+Each `delegate_agent` and `consult_agents` call requires a `task_id` and a `session_id`. Reuse one `session_id` for every agent call in a chat, including calls for different tasks in that chat; use a new one in a new chat. By default, the bridge atomically allows at most four launched agent calls and three distinct peer agents per `session_id` (configurable via top-level `max_session_calls` and `max_session_peers` integers in `config.json`). A consultation with two agents uses two call slots. The server cannot read a host chat identifier from standard MCP tool arguments, so the orchestrating agent creates the session ID once and carries it forward. `usage_report` accepts `session_id` to inspect the budget. This is a hard limit per supplied identifier; it cannot authenticate that an identifier corresponds to a particular chat.
 
 ## MCP call timeout
 
@@ -80,7 +80,7 @@ Add an entry under `agents`. The bridge builds a subprocess argument list direct
 }
 ```
 
-Required fields are `command`, `label`, `args`, and `task_args`. Both modes are required. `model_args` is optional and is added only when a model is configured. Supported placeholders are `{task}`, `{model}`, `{agent}`, and `{mode}`. Each array item becomes one command-line argument, so spaces in a task stay within its argument. To disable a built-in agent without removing its settings, set `"enabled": false`.
+Required fields are `command`, `label`, `args`, and `task_args`. Both modes are required. `model_args` is optional and is added only when a model is configured. Optional `parser` (`codex`, `claude`, `agy`, `opencode`, or `plain`) reuses structured output and token-usage parsing from a built-in CLI. Supported placeholders are `{task}`, `{model}`, `{agent}`, and `{mode}`. Each array item becomes one command-line argument, so spaces in a task stay within its argument. To disable a built-in agent without removing its settings, set `"enabled": false`.
 
 For a custom agent named `my-agent`, set `AGENT_ORCHESTRATOR_BIN_MY_AGENT` in the MCP server environment to override its executable path. Built-in path overrides are `AGY_BIN`, `CLAUDE_BIN`, and `OPENCODE_BIN`.
 
