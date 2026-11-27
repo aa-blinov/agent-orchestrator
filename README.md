@@ -8,7 +8,7 @@ Use Codex, Antigravity, Claude Code, or OpenCode as the orchestrator. The active
 
 ## Quick start
 
-Install Python 3.9 or newer and the coding CLIs you want to use. Register the same bridge with each orchestrator you want to switch between. Run these commands from this repository directory:
+Install Python 3.12 or newer and the coding CLIs you want to use. Register the same bridge with each orchestrator you want to switch between. Run these commands from this repository directory:
 
 ```bash
 codex mcp add --env AGENT_ORCHESTRATOR_HOST=codex local-agents -- python3 "$PWD/src/agent_orchestrator.py"
